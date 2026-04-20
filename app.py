@@ -9,12 +9,31 @@ Run:
 """
 from __future__ import annotations
 
+import os
 from datetime import date, datetime
+
+import streamlit as st
+
+# Must be the first Streamlit command (required by Streamlit).
+st.set_page_config(
+    page_title="Quant Regime Dashboard",
+    page_icon="■",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# Streamlit Community Cloud: paste keys in the dashboard "Secrets" UI — copy here
+# so src.config sees them via os.environ (local dev still uses `.env`).
+try:
+    for _secret in ("FRED_API_KEY", "NASDAQ_DATA_LINK_API_KEY"):
+        if _secret in st.secrets:
+            os.environ.setdefault(_secret, str(st.secrets[_secret]))
+except Exception:
+    pass
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-import streamlit as st
 
 from src.config import (
     BUCKET_WEIGHTS,
@@ -35,15 +54,8 @@ from src.indicators import (
 
 
 # ---------------------------------------------------------------------------
-# Page config + style
+# Global CSS
 # ---------------------------------------------------------------------------
-st.set_page_config(
-    page_title="Quant Regime Dashboard",
-    page_icon="■",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
 st.markdown(
     """
     <style>
@@ -547,6 +559,13 @@ with rc2:
         "SPY vs (TLT+GLD)/2  20D correlation",
         ref_lines=[(0.6, "liquidity event")],
         extra_direction="risk_high_is_top",
+        marker_ts=ts_marker,
+    )
+    _line(
+        raw.series.get("cta_positioning"),
+        "CTA Net Long — CFTC Leveraged Funds, S&P 500 E-mini (% of OI)",
+        ref_lines=[(10, "CTAs fully loaded → top risk"), (-10, "CTAs capitulated → bottom setup"), (0, "neutral")],
+        indicator_key="cta_positioning",
         marker_ts=ts_marker,
     )
 

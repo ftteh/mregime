@@ -157,6 +157,19 @@ INDICATORS: list[IndicatorSpec] = [
         direction="contrarian_high_is_top",
         description="SPX earnings yield minus 10Y. Negative = expensive. INVERTED: high ERP = cheap.",
     ),
+
+    # 5. CTA / Institutional Positioning (bonus — folded into sentiment pillar)
+    IndicatorSpec(
+        key="cta_positioning", label="CTA Net Long (CFTC COT, % OI)",
+        bucket="sentiment_positioning", source="CFTC:TFF fut_fin_txt",
+        direction="risk_high_is_top",
+        description=(
+            "CFTC Traders in Financial Futures — Leveraged Funds net long in "
+            "S&P 500 E-mini as % of open interest. "
+            ">10% net long = CTAs fully loaded (top risk). "
+            "<-10% net short = CTAs capitulated (bottom setup). Weekly."
+        ),
+    ),
 ]
 
 INDICATORS_BY_KEY = {i.key: i for i in INDICATORS}

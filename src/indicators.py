@@ -125,6 +125,7 @@ def build_raw() -> RawFrame:
     s["corr_cluster"] = D.correlation_cluster()
     s["move_vix_div"] = D.move_vs_vix_spread()
     s["dix"] = D.dix_proxy()
+    s["cta_positioning"] = D.cftc_cta_positioning()
     s["spx"] = spx_px
 
     # Metadata (current value + freshness)

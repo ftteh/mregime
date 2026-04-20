@@ -699,3 +699,79 @@ def dix_proxy() -> pd.Series:
         except Exception as e:
             log.warning("DIX fetch failed: %s", e)
     return pd.Series(dtype=float, name="dix")
+
+
+# ---------------------------------------------------------------------------
+# CTA / Leveraged-Fund Equity Positioning (CFTC COT TFF)
+# ---------------------------------------------------------------------------
+def cftc_cta_positioning() -> pd.Series:
+    """
+    CFTC Traders in Financial Futures (TFF) — Leveraged Funds net position
+    in S&P 500 E-mini futures as % of open interest.
+
+    Interpretation (contrarian):
+      High net-long %  (>10% OI)  → CTAs heavily long → top risk
+      High net-short % (<-10% OI) → CTAs capitulated  → bottom setup
+
+    Data: CFTC publishes free weekly TXT/CSV ZIPs for each calendar year.
+    We download 3 years + current year and concatenate.
+    """
+    from datetime import date as _date
+
+    current_year = _date.today().year
+    years = [current_year - 2, current_year - 1, current_year]
+
+    frames = []
+    for yr in years:
+        url = f"https://www.cftc.gov/files/dea/history/fut_fin_txt_{yr}.zip"
+        try:
+            r = requests.get(url, headers=UA, timeout=20)
+            if not r.ok:
+                continue
+            z = __import__("zipfile").ZipFile(io.BytesIO(r.content))
+            csv_files = [n for n in z.namelist() if n.lower().endswith((".txt", ".csv"))]
+            if not csv_files:
+                continue
+            df = pd.read_csv(z.open(csv_files[0]), low_memory=False)
+            # Keep only S&P 500 E-mini rows
+            mask = df["Market_and_Exchange_Names"].str.contains(
+                "E-MINI S&P 500", na=False, case=False
+            )
+            sub = df[mask].copy()
+            if sub.empty:
+                continue
+            frames.append(sub)
+        except Exception as e:
+            log.warning("CFTC COT %d failed: %s", yr, e)
+
+    if not frames:
+        return pd.Series(dtype=float, name="cta_positioning")
+
+    df = pd.concat(frames, ignore_index=True)
+
+    # Parse date (format: YYMMDD or YYYYMMDD)
+    date_col = next((c for c in df.columns if "Date" in c and "Form" in c), None) \
+               or next((c for c in df.columns if "date" in c.lower()), None)
+    if date_col is None:
+        return pd.Series(dtype=float, name="cta_positioning")
+
+    df["date"] = pd.to_datetime(df[date_col].astype(str), format="%y%m%d", errors="coerce")
+    df.loc[df["date"].isna(), "date"] = pd.to_datetime(
+        df.loc[df["date"].isna(), date_col].astype(str), format="%Y%m%d", errors="coerce"
+    )
+    df = df.dropna(subset=["date"]).set_index("date").sort_index()
+    df = df[~df.index.duplicated(keep="last")]
+
+    long_col  = "Lev_Money_Positions_Long_All"
+    short_col = "Lev_Money_Positions_Short_All"
+    oi_col    = "Open_Interest_All"
+
+    for c in (long_col, short_col, oi_col):
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    df = df.dropna(subset=[long_col, short_col, oi_col])
+
+    # Net position as % of total open interest
+    net_pct = (df[long_col] - df[short_col]) / df[oi_col] * 100
+    net_pct.name = "cta_positioning"
+    return net_pct
