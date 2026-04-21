@@ -58,6 +58,33 @@ After that, everything is cached for 1 hour. Click **Refresh data** in the sideb
 
 ---
 
+## Deploy free (Streamlit Community Cloud)
+
+[Streamlit Community Cloud](https://streamlit.io/cloud) hosts one app per repo for free. The **free** tier deploys from a **public** GitHub repository (never commit `.env` — it stays gitignored).
+
+1. Push this project to GitHub (see `.gitignore`: `.env` is excluded).
+2. Go to [share.streamlit.io](https://share.streamlit.io) → sign in with GitHub → **Create app**.
+3. Select your repo, branch **`main`**, main file **`app.py`**, then **Deploy**.
+4. After deploy: **App settings** (⚙️) → **Secrets** → paste ([TOML format](https://docs.streamlit.io/streamlit-community-cloud/deploy-your-app/secrets-management)):
+
+   ```toml
+   FRED_API_KEY = "your_fred_key_here"
+   ```
+
+   Optional (AAII, if your Nasdaq key works from Cloud):
+
+   ```toml
+   NASDAQ_DATA_LINK_API_KEY = "optional"
+   ```
+
+5. **Save** — the app restarts and picks up keys (same names as `.env` locally).
+
+Cold starts can take **1–2 minutes** (downloads breadth data). The `cache/` put/call file is ephemeral on Cloud and resets between runs; the app still works.
+
+**Private repo + free:** use a public fork for deploy only, or paid Streamlit Team, or host elsewhere (e.g. [Render](https://render.com) free tier with a `Dockerfile` running `streamlit run app.py`).
+
+---
+
 ## Data sources (all free)
 
 | Source | What we pull | Method |
