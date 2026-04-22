@@ -68,6 +68,25 @@ st.markdown(
         display:inline-block; padding:2px 10px; border-radius: 999px;
         font-size: 0.75rem; font-weight:600; color:#fff; margin-right:6px;
     }
+    .mom-label {
+        font-size: 1rem; color: #ccc; margin-bottom: 2px;
+    }
+    .mom-today {
+        font-size: 2rem; font-weight: 700; color: #ffffff; line-height: 1;
+        margin-right: 6px;
+    }
+    .mom-pill {
+        display: inline-block;
+        padding: 6px 14px;
+        border-radius: 999px;
+        font-size: 1rem;
+        font-weight: 700;
+        color: #ffffff;
+        margin-right: 8px;
+        margin-top: 6px;
+        letter-spacing: 0.2px;
+        box-shadow: 0 1px 2px rgba(0,0,0,0.35);
+    }
     .card {
         background: rgba(255,255,255,0.02);
         border: 1px solid rgba(255,255,255,0.08);
@@ -299,6 +318,82 @@ def _line(
     st.plotly_chart(fig, width="stretch")
 
 
+# ---------------------------------------------------------------------------
+# Header metric tiles with sparklines
+# ---------------------------------------------------------------------------
+def _sparkline(series: pd.Series, *, bad_direction: str = "up", height: int = 38) -> go.Figure | None:
+    """Tiny trend chart — 60-day history, no axes, color by net change over window."""
+    if series is None or series.empty or len(series) < 2:
+        return None
+    s = series.copy()
+    if s.index.tz is not None:
+        s.index = s.index.tz_localize(None)
+    s = s.sort_index().dropna().tail(60)
+    if s.empty:
+        return None
+    chg = s.iloc[-1] - s.iloc[0]
+    if bad_direction == "up":
+        rgb = (255, 107, 107) if chg > 0 else (79, 201, 120)
+    else:
+        rgb = (79, 201, 120) if chg > 0 else (255, 107, 107)
+    line_color = f"rgb({rgb[0]},{rgb[1]},{rgb[2]})"
+    fill_color = f"rgba({rgb[0]},{rgb[1]},{rgb[2]},0.20)"
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=s.index,
+            y=s.values,
+            mode="lines",
+            line=dict(width=1.6, color=line_color),
+            fill="tozeroy",
+            fillcolor=fill_color,
+            showlegend=False,
+            hovertemplate="%{x|%Y-%m-%d}<br>%{y:.2f}<extra></extra>",
+        )
+    )
+    fig.update_layout(
+        height=height,
+        margin=dict(l=0, r=0, t=0, b=0),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        xaxis=dict(visible=False, showgrid=False, showticklabels=False),
+        yaxis=dict(visible=False, showgrid=False, showticklabels=False, range=[s.min() - (s.max() - s.min()) * 0.05, s.max() + (s.max() - s.min()) * 0.05] if s.max() != s.min() else None),
+    )
+    return fig
+
+
+def _metric_tile(
+    label: str,
+    series: pd.Series | None,
+    *,
+    value_fmt: str = "{:,.2f}",
+    delta_mode: str = "diff",         # "diff" | "pct" | "none"
+    delta_fmt: str | None = None,
+    bad_direction: str = "up",         # "up" = rising is bad (VIX, HY); "down" = falling is bad (SPX, F&G)
+) -> None:
+    """Header metric: label + value + 1-day delta + 60-day sparkline."""
+    if series is None or series.empty:
+        st.caption(f"{label}: no data")
+        return
+    last = float(series.iloc[-1])
+    prev = float(series.iloc[-2]) if len(series) > 1 else last
+    delta_str: str | None = None
+    if delta_mode == "diff":
+        d = last - prev
+        delta_str = (delta_fmt or "{:+.2f}").format(d)
+    elif delta_mode == "pct":
+        d = (last / prev - 1) * 100 if prev else 0.0
+        delta_str = (delta_fmt or "{:+.2f}%").format(d)
+    delta_color = "normal"
+    if delta_mode != "none" and delta_str is not None:
+        # st.metric: "inverse" flips the red/green; we want red/green to map to GOOD vs BAD
+        delta_color = "inverse" if bad_direction == "up" else "normal"
+    st.metric(label, value_fmt.format(last), delta=delta_str, delta_color=delta_color)
+    spark = _sparkline(series, bad_direction=bad_direction, height=36)
+    if spark is not None:
+        st.plotly_chart(spark, width="stretch", config={"displayModeBar": False})
+
+
 composite_score = comp["composite"]
 label, emoji, color = regime_label(composite_score) if not np.isnan(composite_score) else ("NO DATA", "?", "#555")
 
@@ -352,29 +447,57 @@ with hc1:
     )
 
 with hc2:
-    spx = raw.series.get("spx", pd.Series(dtype=float))
-    if not spx.empty:
-        last = spx.iloc[-1]
-        prev = spx.iloc[-2] if len(spx) > 1 else last
-        chg = (last / prev - 1) * 100
-        st.metric("S&P 500", f"{last:,.2f}", f"{chg:+.2f}%")
-    vx = raw.series.get("vix", pd.Series(dtype=float))
-    if not vx.empty:
-        st.metric("VIX", f"{vx.iloc[-1]:.2f}")
+    _metric_tile(
+        "S&P 500",
+        raw.series.get("spx"),
+        value_fmt="{:,.2f}",
+        delta_mode="pct",
+        bad_direction="down",
+    )
+    _metric_tile(
+        "VIX",
+        raw.series.get("vix"),
+        value_fmt="{:.2f}",
+        delta_mode="diff",
+        bad_direction="up",
+    )
+    # HY spread is in percent on FRED → render as bps
     hy = raw.series.get("hy_spread", pd.Series(dtype=float))
-    if not hy.empty:
-        st.metric("HY Spread (bps)", f"{hy.iloc[-1]*100:.0f}")
+    hy_bps = (hy * 100.0) if not hy.empty else hy
+    _metric_tile(
+        "HY Spread (bps)",
+        hy_bps,
+        value_fmt="{:,.0f}",
+        delta_mode="diff",
+        delta_fmt="{:+.0f}",
+        bad_direction="up",
+    )
 
 with hc3:
-    fg = raw.series.get("fear_greed", pd.Series(dtype=float))
-    if not fg.empty:
-        st.metric("Fear & Greed", f"{fg.iloc[-1]:.0f}")
-    naaim = raw.series.get("naaim", pd.Series(dtype=float))
-    if not naaim.empty:
-        st.metric("NAAIM Exposure", f"{naaim.iloc[-1]:.1f}")
-    aaii = raw.series.get("aaii_bull_bear", pd.Series(dtype=float))
-    if not aaii.empty:
-        st.metric("AAII Bull−Bear", f"{aaii.iloc[-1]:+.1f}")
+    _metric_tile(
+        "Fear & Greed",
+        raw.series.get("fear_greed"),
+        value_fmt="{:.0f}",
+        delta_mode="diff",
+        delta_fmt="{:+.0f}",
+        bad_direction="down",
+    )
+    _metric_tile(
+        "NAAIM Exposure",
+        raw.series.get("naaim"),
+        value_fmt="{:.1f}",
+        delta_mode="diff",
+        delta_fmt="{:+.1f}",
+        bad_direction="up",
+    )
+    _metric_tile(
+        "AAII Bull−Bear",
+        raw.series.get("aaii_bull_bear"),
+        value_fmt="{:+.1f}",
+        delta_mode="diff",
+        delta_fmt="{:+.1f}",
+        bad_direction="up",
+    )
 
 with hc4:
     st.markdown("**Cluster signals**")
@@ -429,16 +552,15 @@ st.caption(
 def _momentum_color_and_tag(delta: float, window: str) -> tuple[str, str]:
     if np.isnan(delta):
         return ("#7f8c8d", "—")
-    a = abs(delta)
     if delta >= 10:
-        return ("#e67e22", f"deteriorating fast ({window})")
+        return ("#ff4d4d", f"deteriorating fast ({window})")   # bright red
     if delta >= 5:
-        return ("#f1c40f", f"drifting toward top ({window})")
+        return ("#ff9f1a", f"drifting toward top ({window})")  # bright orange
     if delta <= -10:
-        return ("#16a085", f"improving fast ({window})")
+        return ("#00c08a", f"improving fast ({window})")       # vivid green
     if delta <= -5:
-        return ("#27ae60", f"drifting toward bottom ({window})")
-    return ("#95a5a6", f"stable ({window})")
+        return ("#4fc978", f"drifting toward bottom ({window})")
+    return ("#6b7a85", f"stable ({window})")
 
 mc = st.columns(4)
 for col, bkey in zip(mc, pillar_order):
@@ -458,10 +580,10 @@ for col, bkey in zip(mc, pillar_order):
         d1w_s = "—" if np.isnan(d1w) else f"{d1w:+.1f}"
         d1m_s = "—" if np.isnan(d1m) else f"{d1m:+.1f}"
         st.markdown(
-            f"<div style='font-size:0.9rem;color:#aaa'>today <b style='color:#fff'>{today:.0f}</b></div>"
-            f"<div style='margin-top:4px;'>"
-            f"<span class='pill' style='background:{c1w}'>1w {arr1w} {d1w_s}</span>"
-            f"<span class='pill' style='background:{c1m}'>1m {arr1m} {d1m_s}</span>"
+            f"<div class='mom-label'>today <span class='mom-today'>{today:.0f}</span></div>"
+            f"<div>"
+            f"<span class='mom-pill' style='background:{c1w}'>1w {arr1w} {d1w_s}</span>"
+            f"<span class='mom-pill' style='background:{c1m}'>1m {arr1m} {d1m_s}</span>"
             f"</div>",
             unsafe_allow_html=True,
         )
@@ -471,8 +593,59 @@ for col, bkey in zip(mc, pillar_order):
 # INDICATOR TABLE
 # ---------------------------------------------------------------------------
 st.markdown("### Indicator breakdown")
+
+# Unit + precision per indicator for the "Latest" column
+INDICATOR_UNITS: dict[str, str] = {
+    "hy_spread": "%",
+    "ig_spread": "%",
+    "move_index": "pts",
+    "net_liquidity": "$B",
+    "financial_conditions": "σ",
+    "pct_above_200dma": "%",
+    "ad_line_slope": "",
+    "rsi_spx": "",
+    "new_highs_lows": "",
+    "aaii_bull_bear": "pp",
+    "naaim": "",
+    "fear_greed": "/100",
+    "put_call": "",
+    "vix": "",
+    "vvix": "",
+    "skew": "",
+    "equity_risk_premium": "%",
+    "cta_positioning": "%",
+    "vix_term_9d_1m": "x",
+    "vix_term_1m_3m": "x",
+    "curve_2s10s": "pp",
+    "curve_3m10y": "pp",
+    "curve_resteep_2s10s": "pp",
+    "hy_spread_velocity": "bps",
+    "dxy": "",
+    "real_yield_10y": "%",
+    "copper_gold": "x",
+}
+
+
+def _fmt_raw_cell(row: pd.Series) -> str:
+    v = row.get("raw")
+    if pd.isna(v):
+        return "—"
+    key = row.get("key", "")
+    unit = INDICATOR_UNITS.get(key, "")
+    # Per-indicator precision
+    if key in ("ad_line_slope", "new_highs_lows", "fear_greed", "dxy", "net_liquidity"):
+        val = f"{v:,.0f}"
+    elif key in ("copper_gold", "vix_term_9d_1m", "vix_term_1m_3m", "put_call"):
+        val = f"{v:.3f}"
+    elif key in ("hy_spread_velocity", "aaii_bull_bear", "cta_positioning", "equity_risk_premium"):
+        val = f"{v:+,.1f}"
+    else:
+        val = f"{v:,.2f}"
+    return f"{val} {unit}".strip() if unit else val
+
+
 tbl = scores.copy()
-tbl["raw"] = tbl["raw"].apply(lambda x: f"{x:,.2f}" if pd.notna(x) else "—")
+tbl["raw"] = tbl.apply(_fmt_raw_cell, axis=1)
 tbl["percentile"] = tbl["percentile"].round(1)
 tbl["score"] = tbl["score"].round(1)
 tbl["bucket"] = tbl["bucket"].map(pillar_names)
@@ -720,11 +893,15 @@ with rc2:
 
 
 # ---------------------------------------------------------------------------
-# LEADING INDICATORS — term structure, yield curve, velocity, macro
+# VOLATILITY TERM STRUCTURE — backwardation = bottom signal
 # ---------------------------------------------------------------------------
-st.markdown("#### Leading indicators (new)")
-lc1, lc2 = st.columns(2)
-with lc1:
+st.markdown("### Volatility term structure")
+st.caption(
+    "Ratio **> 1.0 = backwardation** (near-term vol > longer-term vol) = acute panic. "
+    "Historically marks short-term bottoms within ~3 trading days."
+)
+vc1, vc2 = st.columns(2)
+with vc1:
     _line(
         raw.series.get("vix_term_9d_1m"),
         "VIX9D / VIX  (near-term backwardation)",
@@ -732,6 +909,26 @@ with lc1:
         indicator_key="vix_term_9d_1m",
         marker_ts=ts_marker,
     )
+with vc2:
+    _line(
+        raw.series.get("vix_term_1m_3m"),
+        "VIX / VIX3M  (full-term backwardation)",
+        ref_lines=[(1.0, "backwardation → bottom")],
+        indicator_key="vix_term_1m_3m",
+        marker_ts=ts_marker,
+    )
+
+
+# ---------------------------------------------------------------------------
+# YIELD CURVE — inversion & re-steepening
+# ---------------------------------------------------------------------------
+st.markdown("### Yield curve — inversion & re-steepening")
+st.caption(
+    "The signal isn't inversion itself — it's the **re-steepening from inversion**. "
+    "Every US recession since 1970 started with the curve un-inverting off its trough."
+)
+yc1, yc2 = st.columns(2)
+with yc1:
     _line(
         raw.series.get("curve_2s10s"),
         "2s10s Yield Curve (T10Y2Y)",
@@ -739,6 +936,27 @@ with lc1:
         indicator_key="curve_2s10s",
         marker_ts=ts_marker,
     )
+with yc2:
+    _line(
+        raw.series.get("curve_resteep_2s10s"),
+        "2s10s Re-steepening from Inversion",
+        ref_lines=[(0.5, "active re-steepening → top warning"), (1.0, "strong re-steepen")],
+        indicator_key="curve_resteep_2s10s",
+        marker_ts=ts_marker,
+    )
+
+
+# ---------------------------------------------------------------------------
+# CREDIT VELOCITY & MACRO CONTEXT
+# ---------------------------------------------------------------------------
+st.markdown("### Credit velocity & macro context")
+st.caption(
+    "**HY 4W Δ** is the fastest risk-off trigger. "
+    "**DXY / real yields** proxy liquidity drain. "
+    "**Copper/Gold** leads HY spreads by 1–2 months."
+)
+mc1, mc2 = st.columns(2)
+with mc1:
     _line(
         raw.series.get("hy_spread_velocity"),
         "HY Spread — 4W change (bps)",
@@ -752,22 +970,7 @@ with lc1:
         indicator_key="dxy",
         marker_ts=ts_marker,
     )
-
-with lc2:
-    _line(
-        raw.series.get("vix_term_1m_3m"),
-        "VIX / VIX3M  (full-term backwardation)",
-        ref_lines=[(1.0, "backwardation → bottom")],
-        indicator_key="vix_term_1m_3m",
-        marker_ts=ts_marker,
-    )
-    _line(
-        raw.series.get("curve_resteep_2s10s"),
-        "2s10s Re-steepening from Inversion",
-        ref_lines=[(0.5, "active re-steepening → top warning"), (1.0, "strong re-steepen")],
-        indicator_key="curve_resteep_2s10s",
-        marker_ts=ts_marker,
-    )
+with mc2:
     _line(
         raw.series.get("real_yield_10y"),
         "10Y TIPS Real Yield (%)",
