@@ -236,12 +236,20 @@ def historical_pillar_scores(raw: RawFrame) -> pd.DataFrame:
         s = raw.series.get(key, pd.Series(dtype=float))
         if s is None or s.empty:
             continue
-        # Resample to business-day grid so pillar avg aligns across mixed frequencies
+        # Resample to business-day grid so pillar avg aligns across mixed frequencies.
+        # Some feeds (AAII/NAAIM/put-call cache) occasionally emit duplicate
+        # timestamps; resample() then reindexes and raises on duplicates, so
+        # dedupe first.
         s_d = s.copy()
         if s_d.index.tz is not None:
             s_d.index = s_d.index.tz_localize(None)
         s_d = s_d.sort_index()
-        s_d = s_d.resample("B").ffill()
+        s_d = s_d[~s_d.index.duplicated(keep="last")]
+        try:
+            s_d = s_d.resample("B").ffill()
+        except Exception:
+            # Last-resort: skip malformed indicator rather than kill the whole panel
+            continue
         pct = rolling_percentile(s_d)
         score = pct.apply(lambda p, d=spec.direction: orient_score(p, d))
         per_indicator[key] = score
