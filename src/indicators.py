@@ -128,6 +128,23 @@ def build_raw() -> RawFrame:
     s["cta_positioning"] = D.cftc_cta_positioning()
     s["spx"] = spx_px
 
+    # ---- VIX term structure
+    s["vix_term_9d_1m"] = D.vix_term_9d_1m()
+    s["vix_term_1m_3m"] = D.vix_term_1m_3m()
+
+    # ---- Yield curve + re-steepening
+    s["curve_2s10s"] = D.curve_2s10s()
+    s["curve_3m10y"] = D.curve_3m10y()
+    s["curve_resteep_2s10s"] = D.curve_resteep_2s10s()
+
+    # ---- Credit spread velocity
+    s["hy_spread_velocity"] = D.hy_spread_velocity()
+
+    # ---- Macro context
+    s["dxy"] = D.dxy()
+    s["real_yield_10y"] = D.real_yield_10y()
+    s["copper_gold"] = D.copper_gold_ratio()
+
     # Metadata (current value + freshness)
     for k, v in s.items():
         if v is None or v.empty:
@@ -202,3 +219,92 @@ def cluster_signal(scores_df: pd.DataFrame) -> dict:
         "top_names": extreme_top["label"].tolist(),
         "bottom_names": extreme_bot["label"].tolist(),
     }
+
+
+# ---------------------------------------------------------------------------
+# Historical composite — reconstruct the regime score over time
+# ---------------------------------------------------------------------------
+def historical_pillar_scores(raw: RawFrame) -> pd.DataFrame:
+    """
+    Daily DataFrame with one column per pillar, values = pillar score 0-100 over time.
+    Built purely from past data via rolling_percentile (no look-ahead).
+
+    Used by the SPX regime-overlay chart and by pillar_momentum().
+    """
+    per_indicator: Dict[str, pd.Series] = {}
+    for key, spec in INDICATORS_BY_KEY.items():
+        s = raw.series.get(key, pd.Series(dtype=float))
+        if s is None or s.empty:
+            continue
+        # Resample to business-day grid so pillar avg aligns across mixed frequencies
+        s_d = s.copy()
+        if s_d.index.tz is not None:
+            s_d.index = s_d.index.tz_localize(None)
+        s_d = s_d.sort_index()
+        s_d = s_d.resample("B").ffill()
+        pct = rolling_percentile(s_d)
+        score = pct.apply(lambda p, d=spec.direction: orient_score(p, d))
+        per_indicator[key] = score
+
+    if not per_indicator:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(per_indicator)
+    buckets: Dict[str, pd.Series] = {}
+    for bkey in BUCKET_WEIGHTS:
+        cols = [k for k, sp in INDICATORS_BY_KEY.items()
+                if sp.bucket == bkey and k in df.columns]
+        if cols:
+            buckets[bkey] = df[cols].mean(axis=1, skipna=True)
+    return pd.DataFrame(buckets)
+
+
+def historical_composite(raw: RawFrame) -> pd.Series:
+    """Rolling 0-100 composite regime score over time (weighted pillar average)."""
+    pillars = historical_pillar_scores(raw)
+    if pillars.empty:
+        return pd.Series(dtype=float, name="composite")
+    w = pd.Series(BUCKET_WEIGHTS).reindex(pillars.columns).fillna(0.0)
+    if w.sum() == 0:
+        return pd.Series(dtype=float, name="composite")
+    valid = pillars.notna()
+    weighted = pillars.fillna(0.0).mul(w, axis=1).sum(axis=1)
+    denom = valid.mul(w, axis=1).sum(axis=1).replace(0, np.nan)
+    out = (weighted / denom).dropna()
+    out.name = "composite"
+    return out
+
+
+def pillar_momentum(raw: RawFrame) -> dict:
+    """
+    Rate-of-change per pillar: today score, 1 week ago, 1 month ago.
+    Returns dict of pillar -> {today, 1w, 1m, d_1w, d_1m} where d_1w / d_1m are
+    the change (today - prior). Positive delta = moving toward top-risk/complacency.
+    """
+    hist = historical_pillar_scores(raw).dropna(how="all")
+    if hist.empty:
+        return {}
+    hist = hist.ffill()
+
+    def _ago(n: int) -> pd.Series:
+        if len(hist) <= n:
+            return hist.iloc[0]
+        return hist.iloc[-(n + 1)]
+
+    today = hist.iloc[-1]
+    wk = _ago(5)
+    mo = _ago(21)
+
+    out: dict = {}
+    for bkey in hist.columns:
+        t = float(today.get(bkey, np.nan)) if not pd.isna(today.get(bkey, np.nan)) else np.nan
+        w = float(wk.get(bkey, np.nan)) if not pd.isna(wk.get(bkey, np.nan)) else np.nan
+        m = float(mo.get(bkey, np.nan)) if not pd.isna(mo.get(bkey, np.nan)) else np.nan
+        out[bkey] = {
+            "today": t,
+            "w_ago": w,
+            "m_ago": m,
+            "d_1w": (t - w) if not (np.isnan(t) or np.isnan(w)) else np.nan,
+            "d_1m": (t - m) if not (np.isnan(t) or np.isnan(m)) else np.nan,
+        }
+    return out

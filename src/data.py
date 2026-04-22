@@ -163,6 +163,45 @@ def spx() -> pd.Series:
     return yf_series("^GSPC")
 
 
+def vix9d() -> pd.Series:
+    """CBOE 9-day volatility index. Not on yfinance for all ranges; falls back empty."""
+    return yf_series("^VIX9D")
+
+
+def vix3m() -> pd.Series:
+    """CBOE 3-month volatility index."""
+    return yf_series("^VIX3M")
+
+
+def vix_term_9d_1m() -> pd.Series:
+    """
+    VIX9D / VIX ratio. >1.0 = near-term backwardation = acute panic.
+    Historically bottoms within ~3 days of backwardation spikes.
+    """
+    a, b = vix9d(), vix()
+    if a.empty or b.empty:
+        return pd.Series(dtype=float, name="vix_term_9d_1m")
+    df = pd.concat([a.rename("n"), b.rename("d")], axis=1).dropna()
+    if df.empty:
+        return pd.Series(dtype=float, name="vix_term_9d_1m")
+    s = (df["n"] / df["d"]).replace([np.inf, -np.inf], np.nan).dropna()
+    s.name = "vix_term_9d_1m"
+    return s
+
+
+def vix_term_1m_3m() -> pd.Series:
+    """VIX / VIX3M ratio. >1.0 = full-term backwardation = serious stress."""
+    a, b = vix(), vix3m()
+    if a.empty or b.empty:
+        return pd.Series(dtype=float, name="vix_term_1m_3m")
+    df = pd.concat([a.rename("n"), b.rename("d")], axis=1).dropna()
+    if df.empty:
+        return pd.Series(dtype=float, name="vix_term_1m_3m")
+    s = (df["n"] / df["d"]).replace([np.inf, -np.inf], np.nan).dropna()
+    s.name = "vix_term_1m_3m"
+    return s
+
+
 def move_index() -> pd.Series:
     """
     MOVE index is not directly on yfinance. We proxy with realized vol of TLT
@@ -775,3 +814,102 @@ def cftc_cta_positioning() -> pd.Series:
     net_pct = (df[long_col] - df[short_col]) / df[oi_col] * 100
     net_pct.name = "cta_positioning"
     return net_pct
+
+
+# ---------------------------------------------------------------------------
+# Yield curve
+# ---------------------------------------------------------------------------
+def curve_2s10s() -> pd.Series:
+    """10Y - 2Y Treasury yield spread (FRED T10Y2Y). Negative = inverted."""
+    s = _fred("T10Y2Y")
+    s.name = "curve_2s10s"
+    return s
+
+
+def curve_3m10y() -> pd.Series:
+    """10Y - 3M Treasury yield spread (FRED T10Y3M). Fed's preferred recession curve."""
+    s = _fred("T10Y3M")
+    s.name = "curve_3m10y"
+    return s
+
+
+def curve_resteep_2s10s(window: int = 252) -> pd.Series:
+    """
+    Re-steepening-from-inversion signal on 2s10s.
+
+    = max(0, curve_today - rolling_min(curve, 252d))  only when rolling_min < 0.
+
+    Fires only when the curve was inverted at some point in the past year and has
+    since recovered — historically coincides with recession onset and equity tops
+    (2000, 2007, 2020). Large positive values = active un-inversion = top-risk signal.
+    Flat zero values mean either "never inverted in past year" or "still at the trough".
+    """
+    c = curve_2s10s()
+    if c.empty:
+        return pd.Series(dtype=float, name="curve_resteep_2s10s")
+    rmin = c.rolling(window, min_periods=60).min()
+    raw = (c - rmin).clip(lower=0)
+    sig = raw.where(rmin < 0, 0.0)
+    sig.name = "curve_resteep_2s10s"
+    return sig.dropna()
+
+
+# ---------------------------------------------------------------------------
+# Credit spread velocity
+# ---------------------------------------------------------------------------
+def hy_spread_velocity(lookback_days: int = 20) -> pd.Series:
+    """
+    4-week (≈20 business day) change in HY OAS, expressed in BPS.
+
+    FRED BAMLH0A0HYM2 is in percent, so we convert to bps first (×100), then diff.
+    Positive values = spreads widening (stress building). >+75 bps in 4w is the
+    cleanest "risk-off now" trigger in the data (2020, 2022, 2023 regional banks).
+    """
+    s = fred_hy_spread()
+    if s.empty:
+        return pd.Series(dtype=float, name="hy_spread_velocity")
+    bps = s * 100.0
+    vel = bps - bps.shift(lookback_days)
+    vel.name = "hy_spread_velocity"
+    return vel.dropna()
+
+
+# ---------------------------------------------------------------------------
+# Macro context
+# ---------------------------------------------------------------------------
+def dxy() -> pd.Series:
+    """
+    US Dollar Index. yfinance symbols vary — try DX-Y.NYB first (ICE cash index),
+    then ^DXY, then DX=F (futures) as fallback.
+    """
+    for sym in ("DX-Y.NYB", "^DXY", "DX=F"):
+        s = yf_series(sym, period="10y")
+        if not s.empty:
+            s.name = "dxy"
+            return s
+    return pd.Series(dtype=float, name="dxy")
+
+
+def real_yield_10y() -> pd.Series:
+    """10Y TIPS real yield (FRED DFII10), in percent."""
+    s = _fred("DFII10")
+    s.name = "real_yield_10y"
+    return s
+
+
+def copper_gold_ratio() -> pd.Series:
+    """
+    Copper / Gold ratio (front-month futures). Growth proxy — leads HY spreads
+    by 1-2 months. High ratio = growth strong / risk-on.
+    Low ratio = growth fears / risk-off.
+    """
+    cu = yf_series("HG=F", period="10y")
+    au = yf_series("GC=F", period="10y")
+    if cu.empty or au.empty:
+        return pd.Series(dtype=float, name="copper_gold")
+    df = pd.concat([cu.rename("cu"), au.rename("au")], axis=1).dropna()
+    if df.empty:
+        return pd.Series(dtype=float, name="copper_gold")
+    s = (df["cu"] / df["au"]).replace([np.inf, -np.inf], np.nan).dropna()
+    s.name = "copper_gold"
+    return s

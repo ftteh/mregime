@@ -47,8 +47,10 @@ from src.indicators import (
     build_raw,
     cluster_signal,
     composite,
+    historical_composite,
     latest_percentile,
     orient_score,
+    pillar_momentum,
     score_indicators,
 )
 
@@ -86,7 +88,9 @@ def load_all():
     scores = score_indicators(raw)
     comp = composite(scores)
     cluster = cluster_signal(scores)
-    return raw, scores, comp, cluster
+    momentum = pillar_momentum(raw)
+    comp_hist = historical_composite(raw)
+    return raw, scores, comp, cluster, momentum, comp_hist
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +137,7 @@ with st.sidebar:
 # ---------------------------------------------------------------------------
 # Load
 # ---------------------------------------------------------------------------
-raw, scores, comp, cluster = load_all()
+raw, scores, comp, cluster, momentum, comp_hist = load_all()
 
 # All time-series charts share this x-axis window (aligned duration)
 CHART_LOOKBACK_YEARS = 3
@@ -413,6 +417,57 @@ for col, bkey in zip(bc, pillar_order):
 
 
 # ---------------------------------------------------------------------------
+# PILLAR MOMENTUM — rate-of-change per pillar (1w / 1m)
+# ---------------------------------------------------------------------------
+st.markdown("### Pillar momentum — is the regime shifting?")
+st.caption(
+    "Δ = change in pillar score. **Positive Δ = moving toward top-risk/complacency** "
+    "(sell pressure building). **Negative Δ = moving toward panic/bottom** "
+    "(buy setup forming). |Δ| ≥ 10 over 1w = deteriorating/improving fast."
+)
+
+def _momentum_color_and_tag(delta: float, window: str) -> tuple[str, str]:
+    if np.isnan(delta):
+        return ("#7f8c8d", "—")
+    a = abs(delta)
+    if delta >= 10:
+        return ("#e67e22", f"deteriorating fast ({window})")
+    if delta >= 5:
+        return ("#f1c40f", f"drifting toward top ({window})")
+    if delta <= -10:
+        return ("#16a085", f"improving fast ({window})")
+    if delta <= -5:
+        return ("#27ae60", f"drifting toward bottom ({window})")
+    return ("#95a5a6", f"stable ({window})")
+
+mc = st.columns(4)
+for col, bkey in zip(mc, pillar_order):
+    m = momentum.get(bkey, {}) if isinstance(momentum, dict) else {}
+    today = m.get("today", np.nan)
+    d1w = m.get("d_1w", np.nan)
+    d1m = m.get("d_1m", np.nan)
+    with col:
+        st.markdown(f"**{pillar_names[bkey]}**")
+        if isinstance(today, float) and np.isnan(today):
+            st.caption("no history yet")
+            continue
+        c1w, _ = _momentum_color_and_tag(d1w, "1w")
+        c1m, _ = _momentum_color_and_tag(d1m, "1m")
+        arr1w = "▲" if (not np.isnan(d1w) and d1w > 0) else ("▼" if (not np.isnan(d1w) and d1w < 0) else "—")
+        arr1m = "▲" if (not np.isnan(d1m) and d1m > 0) else ("▼" if (not np.isnan(d1m) and d1m < 0) else "—")
+        d1w_s = "—" if np.isnan(d1w) else f"{d1w:+.1f}"
+        d1m_s = "—" if np.isnan(d1m) else f"{d1m:+.1f}"
+        st.markdown(
+            f"<div style='font-size:0.9rem;color:#aaa'>today <b style='color:#fff'>{today:.0f}</b></div>"
+            f"<div style='margin-top:4px;'>"
+            f"<span class='pill' style='background:{c1w}'>1w {arr1w} {d1w_s}</span>"
+            f"<span class='pill' style='background:{c1m}'>1m {arr1m} {d1m_s}</span>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+
+# ---------------------------------------------------------------------------
 # INDICATOR TABLE
 # ---------------------------------------------------------------------------
 st.markdown("### Indicator breakdown")
@@ -448,6 +503,100 @@ styled = tbl[display_cols].rename(columns={
 }).style.map(_highlight_score, subset=["Top-risk score"])
 
 st.dataframe(styled, use_container_width=True, hide_index=True)
+
+
+# ---------------------------------------------------------------------------
+# SPX + HISTORICAL REGIME OVERLAY
+# ---------------------------------------------------------------------------
+st.markdown("### SPX with historical regime bands")
+st.caption(
+    "Background color = composite regime on that day (same scale as the gauge). "
+    "Lets you eyeball every past top/bottom call at once: red bands before drawdowns, "
+    "green bands before rallies."
+)
+
+
+def _regime_color_for_score(v: float) -> str:
+    if np.isnan(v):
+        return "rgba(127,127,127,0.0)"
+    if v >= 85:   return "rgba(192, 57, 43, 0.22)"
+    if v >= 65:   return "rgba(230,126, 34, 0.18)"
+    if v >= 55:   return "rgba(241,196, 15, 0.14)"
+    if v >= 45:   return "rgba(149,165,166, 0.10)"
+    if v >= 35:   return "rgba( 52,152,219, 0.14)"
+    if v >= 15:   return "rgba( 39,174, 96, 0.18)"
+    return            "rgba( 22,160,133, 0.22)"
+
+
+def _render_spx_regime_overlay() -> None:
+    spx_full = raw.series.get("spx", pd.Series(dtype=float))
+    if spx_full is None or spx_full.empty or comp_hist is None or comp_hist.empty:
+        st.info("Not enough history yet to render regime bands.")
+        return
+
+    spx_plot = _clip_series_to_chart_window(spx_full)
+    comp_plot = _normalize_series_index(comp_hist)
+    comp_plot = comp_plot.loc[(comp_plot.index >= CHART_START) & (comp_plot.index <= CHART_END)]
+    if spx_plot.empty or comp_plot.empty:
+        st.info("Not enough history in chart window.")
+        return
+
+    # Align composite onto SPX trading calendar so bands line up
+    comp_aligned = comp_plot.reindex(spx_plot.index, method="ffill")
+
+    # Collapse consecutive same-color days into single vrects for performance
+    colors = comp_aligned.apply(_regime_color_for_score)
+    segments: list[tuple[pd.Timestamp, pd.Timestamp, str]] = []
+    if not colors.empty:
+        seg_start = colors.index[0]
+        seg_color = colors.iloc[0]
+        prev_idx = colors.index[0]
+        for idx, col in colors.items():
+            if col != seg_color:
+                segments.append((seg_start, prev_idx, seg_color))
+                seg_start = idx
+                seg_color = col
+            prev_idx = idx
+        segments.append((seg_start, prev_idx, seg_color))
+
+    fig = go.Figure()
+    for x0, x1, col in segments:
+        if "rgba(127" in col:  # skip missing
+            continue
+        fig.add_vrect(x0=x0, x1=x1, fillcolor=col, line_width=0, layer="below")
+
+    fig.add_trace(go.Scatter(
+        x=spx_plot.index, y=spx_plot.values,
+        mode="lines", name="SPX",
+        line=dict(color="#f5f5f5", width=1.8),
+        hovertemplate="%{x|%Y-%m-%d}<br>SPX %{y:,.2f}<extra></extra>",
+    ))
+    if ts_marker is not None:
+        _add_chart_date_marker(fig, spx_plot, ts_marker)
+
+    fig.update_layout(
+        height=380,
+        margin=dict(l=10, r=10, t=20, b=10),
+        hovermode="x unified",
+        showlegend=False,
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="rgba(255,255,255,0.9)"),
+        xaxis=dict(
+            gridcolor="rgba(255,255,255,0.08)",
+            range=[CHART_START, CHART_END],
+            type="date",
+        ),
+        yaxis=dict(gridcolor="rgba(255,255,255,0.08)", title="SPX"),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+# ts_marker is defined below in the time-series grid block; we need it here too.
+# Grab it from session state so the marker lines up across all charts.
+ts_marker = st.session_state.get("ts_marker_date", None)
+_render_spx_regime_overlay()
 
 
 # ---------------------------------------------------------------------------
@@ -566,6 +715,70 @@ with rc2:
         "CTA Net Long — CFTC Leveraged Funds, S&P 500 E-mini (% of OI)",
         ref_lines=[(10, "CTAs fully loaded → top risk"), (-10, "CTAs capitulated → bottom setup"), (0, "neutral")],
         indicator_key="cta_positioning",
+        marker_ts=ts_marker,
+    )
+
+
+# ---------------------------------------------------------------------------
+# LEADING INDICATORS — term structure, yield curve, velocity, macro
+# ---------------------------------------------------------------------------
+st.markdown("#### Leading indicators (new)")
+lc1, lc2 = st.columns(2)
+with lc1:
+    _line(
+        raw.series.get("vix_term_9d_1m"),
+        "VIX9D / VIX  (near-term backwardation)",
+        ref_lines=[(1.0, "backwardation → bottom signal")],
+        indicator_key="vix_term_9d_1m",
+        marker_ts=ts_marker,
+    )
+    _line(
+        raw.series.get("curve_2s10s"),
+        "2s10s Yield Curve (T10Y2Y)",
+        ref_lines=[(0.0, "inversion"), (0.5, "normal")],
+        indicator_key="curve_2s10s",
+        marker_ts=ts_marker,
+    )
+    _line(
+        raw.series.get("hy_spread_velocity"),
+        "HY Spread — 4W change (bps)",
+        ref_lines=[(75, "fast widening = risk-off trigger"), (-75, "fast compression"), (0, "flat")],
+        indicator_key="hy_spread_velocity",
+        marker_ts=ts_marker,
+    )
+    _line(
+        raw.series.get("dxy"),
+        "DXY — US Dollar Index",
+        indicator_key="dxy",
+        marker_ts=ts_marker,
+    )
+
+with lc2:
+    _line(
+        raw.series.get("vix_term_1m_3m"),
+        "VIX / VIX3M  (full-term backwardation)",
+        ref_lines=[(1.0, "backwardation → bottom")],
+        indicator_key="vix_term_1m_3m",
+        marker_ts=ts_marker,
+    )
+    _line(
+        raw.series.get("curve_resteep_2s10s"),
+        "2s10s Re-steepening from Inversion",
+        ref_lines=[(0.5, "active re-steepening → top warning"), (1.0, "strong re-steepen")],
+        indicator_key="curve_resteep_2s10s",
+        marker_ts=ts_marker,
+    )
+    _line(
+        raw.series.get("real_yield_10y"),
+        "10Y TIPS Real Yield (%)",
+        ref_lines=[(0.0, "zero real"), (2.0, "tight")],
+        indicator_key="real_yield_10y",
+        marker_ts=ts_marker,
+    )
+    _line(
+        raw.series.get("copper_gold"),
+        "Copper / Gold Ratio  (growth proxy, leads HY by 1-2m)",
+        indicator_key="copper_gold",
         marker_ts=ts_marker,
     )
 
