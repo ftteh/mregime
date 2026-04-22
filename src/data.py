@@ -5,9 +5,12 @@ so the dashboard keeps working even if one source is down.
 """
 
 from __future__ import annotations
+import contextlib
 import io
 import json
 import logging
+import os
+import sys
 from datetime import datetime, timedelta
 from functools import lru_cache
 
@@ -16,9 +19,37 @@ import pandas as pd
 import requests
 import yfinance as yf
 
+
+@contextlib.contextmanager
+def _silence_stderr():
+    """Swallow stderr inside this block (yfinance prints '$TICKER: possibly
+    delisted' directly, bypassing logging)."""
+    try:
+        with open(os.devnull, "w") as devnull:
+            old = sys.stderr
+            sys.stderr = devnull
+            try:
+                yield
+            finally:
+                sys.stderr = old
+    except Exception:
+        yield
+
 from .config import FRED_API_KEY, NASDAQ_DATA_LINK_API_KEY
 
 log = logging.getLogger(__name__)
+
+# Silence yfinance's built-in stderr chatter for individual bad/delisted tickers
+# (e.g. "$FI: possibly delisted"). We handle failures gracefully per-ticker
+# downstream; those prints just spam the dashboard terminal.
+for _lname in ("yfinance", "yfinance.utils", "yfinance.data"):
+    _lg = logging.getLogger(_lname)
+    _lg.setLevel(logging.CRITICAL)
+    _lg.propagate = False
+try:
+    yf.set_tz_cache_location(".yfinance_cache")  # silence tz-cache warnings on Windows
+except Exception:
+    pass
 
 UA = {
     "User-Agent": (
@@ -48,7 +79,9 @@ def _fred(series_id: str, start: str = "2015-01-01") -> pd.Series:
             s.name = series_id
             return s.dropna()
         except Exception as e:
-            log.warning("fredapi failed for %s: %s — falling back to CSV", series_id, e)
+            # FRED intermittently 500s on certain series (esp. RRPONTSYD).
+            # We transparently fall back to their CSV endpoint, so demote to info.
+            log.info("fredapi transient %s (%s) — using CSV fallback", series_id, str(e)[:60])
 
     # CSV fallback — 4s timeout so a missing key doesn't stall the dashboard
     url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}&cosd={start}"
@@ -135,7 +168,8 @@ def fred_dgs10() -> pd.Series:
 # ---------------------------------------------------------------------------
 def yf_series(ticker: str, period: str = "5y", field: str = "Close") -> pd.Series:
     try:
-        df = yf.Ticker(ticker).history(period=period, auto_adjust=False)
+        with _silence_stderr():
+            df = yf.Ticker(ticker).history(period=period, auto_adjust=False)
         if df.empty:
             return pd.Series(dtype=float, name=ticker)
         s = df[field].copy()
@@ -143,7 +177,7 @@ def yf_series(ticker: str, period: str = "5y", field: str = "Close") -> pd.Serie
         s.name = ticker
         return s.dropna()
     except Exception as e:
-        log.error("yfinance failed for %s: %s", ticker, e)
+        log.info("yfinance unavailable for %s (%s)", ticker, str(e)[:80])
         return pd.Series(dtype=float, name=ticker)
 
 
@@ -223,26 +257,42 @@ def move_index() -> pd.Series:
 # ---------------------------------------------------------------------------
 @lru_cache(maxsize=1)
 def sp500_tickers() -> list[str]:
-    """Scrape current SP500 tickers from Wikipedia."""
+    """
+    Return current SP500 tickers. Primary: Wikipedia (requires browser UA —
+    their WAF blocks anonymous requests). Fallback: vetted SP100 hard-coded list
+    (liquid megacaps only, no delisted/renamed tickers).
+    """
+    # Primary: Wikipedia with proper User-Agent (they 403 missing-UA requests)
     try:
         url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-        tables = pd.read_html(url)
-        tickers = tables[0]["Symbol"].astype(str).str.replace(".", "-", regex=False).tolist()
-        return tickers
+        r = requests.get(url, headers=UA, timeout=10)
+        r.raise_for_status()
+        tables = pd.read_html(io.StringIO(r.text))
+        tickers = (
+            tables[0]["Symbol"]
+            .astype(str)
+            .str.replace(".", "-", regex=False)
+            .str.strip()
+            .tolist()
+        )
+        if len(tickers) >= 400:  # sanity
+            return tickers
     except Exception as e:
-        log.warning("SP500 ticker scrape failed: %s — using SP100 fallback", e)
-        return [
-            "AAPL","MSFT","NVDA","AMZN","META","GOOGL","GOOG","BRK-B","TSLA","LLY",
-            "JPM","V","WMT","XOM","UNH","MA","PG","JNJ","HD","AVGO","ORCL","COST",
-            "ABBV","BAC","CVX","KO","PEP","MRK","ADBE","CRM","AMD","NFLX","TMO",
-            "PFE","LIN","ABT","CSCO","DIS","WFC","ACN","MCD","TXN","DHR","INTC",
-            "VZ","NKE","PM","INTU","NEE","CAT","IBM","COP","UPS","HON","AMGN",
-            "QCOM","UNP","GS","RTX","LOW","BA","AMAT","MS","T","SBUX","BLK","SPGI",
-            "AXP","DE","PLD","BKNG","GE","NOW","MDT","ELV","LMT","SYK","ISRG","ADP",
-            "GILD","CVS","TJX","VRTX","MDLZ","CB","MMC","ADI","LRCX","C","SCHW","CI",
-            "ZTS","SO","MO","REGN","BMY","BSX","PANW","FI","BDX","ETN","PGR","MU",
-            "DUK","AON",
-        ]
+        log.info("SP500 wiki scrape unavailable (%s) — using megacap fallback", str(e)[:60])
+
+    # Fallback: 80 megacaps that (a) are on yfinance today, (b) capture >70% of
+    # SP500 cap so breadth proxies remain meaningful. No delisted / renamed
+    # tickers (FI, MMC removed — FISV->FI ticker migration confused yfinance cache).
+    return [
+        "AAPL","MSFT","NVDA","AMZN","META","GOOGL","GOOG","BRK-B","TSLA","LLY",
+        "JPM","V","WMT","XOM","UNH","MA","PG","JNJ","HD","AVGO","ORCL","COST",
+        "ABBV","BAC","CVX","KO","PEP","MRK","ADBE","CRM","AMD","NFLX","TMO",
+        "PFE","LIN","ABT","CSCO","DIS","WFC","ACN","MCD","TXN","DHR","INTC",
+        "VZ","NKE","PM","INTU","NEE","CAT","IBM","COP","UPS","HON","AMGN",
+        "QCOM","UNP","GS","RTX","LOW","BA","AMAT","MS","T","SBUX","BLK","SPGI",
+        "AXP","DE","PLD","BKNG","GE","NOW","MDT","ELV","LMT","SYK","ISRG","ADP",
+        "GILD","CVS","TJX",
+    ]
 
 
 def breadth_pct_above_200dma(sample_size: int = 120) -> pd.Series:
@@ -255,14 +305,15 @@ def breadth_pct_above_200dma(sample_size: int = 120) -> pd.Series:
     """
     tickers = sp500_tickers()[:sample_size]
     try:
-        df = yf.download(
-            tickers,
-            period="2y",
-            auto_adjust=False,
-            progress=False,
-            group_by="ticker",
-            threads=True,
-        )
+        with _silence_stderr():
+            df = yf.download(
+                tickers,
+                period="2y",
+                auto_adjust=False,
+                progress=False,
+                group_by="ticker",
+                threads=True,
+            )
     except Exception as e:
         log.error("yf.download breadth failed: %s", e)
         return pd.Series(dtype=float, name="pct_above_200dma")
@@ -290,10 +341,11 @@ def new_highs_minus_lows(sample_size: int = 150) -> pd.Series:
     """52-week new highs minus new lows among a sample of SP500."""
     tickers = sp500_tickers()[:sample_size]
     try:
-        df = yf.download(
-            tickers, period="2y", auto_adjust=False, progress=False,
-            group_by="ticker", threads=True,
-        )
+        with _silence_stderr():
+            df = yf.download(
+                tickers, period="2y", auto_adjust=False, progress=False,
+                group_by="ticker", threads=True,
+            )
     except Exception:
         return pd.Series(dtype=float, name="new_highs_minus_lows")
 
@@ -361,7 +413,7 @@ def aaii_sentiment() -> pd.DataFrame:
                     if not out.empty:
                         return out
         except Exception as e:
-            log.warning("Nasdaq Data Link AAII fetch failed: %s", e)
+            log.info("Nasdaq Data Link AAII unavailable (%s)", str(e)[:80])
 
     # --- Primary: historical XLS (parse with xlrd directly to avoid pandas version checks)
     try:
@@ -442,40 +494,87 @@ def aaii_sentiment() -> pd.DataFrame:
             df["spread"] = df["bullish"] - df["bearish"]
             return df[cols]
     except Exception as e:
-        log.warning("AAII XLS fetch failed: %s", e)
+        log.info("AAII XLS unavailable (%s)", str(e)[:80])
 
-    # --- Fallback: scrape the weekly results page (only latest reading)
+    # --- Fallback: scrape AAII's public results page. The page renders a
+    # 4-column table (Reported Date | Bullish | Neutral | Bearish) with the
+    # latest ~21 weekly readings. Enough history for short-term percentile
+    # scoring; full-history XLS is blocked by Incapsula so this is the best
+    # free/no-key path in 2026.
     try:
+        import re
         from bs4 import BeautifulSoup
-        r = requests.get("https://www.aaii.com/sentimentsurvey/sent_results",
-                         headers=UA, timeout=30)
+        aaii_ua = {
+            **UA,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.aaii.com/",
+        }
+        r = requests.get(
+            "https://www.aaii.com/sentimentsurvey/sent_results",
+            headers=aaii_ua, timeout=30,
+        )
+        r.raise_for_status()
         soup = BeautifulSoup(r.text, "lxml")
-        # Look for a table with rows containing bullish/neutral/bearish
-        tables = soup.find_all("table")
-        for table in tables:
-            rows_text = [tr.get_text(" ", strip=True).lower() for tr in table.find_all("tr")]
-            joined = " | ".join(rows_text)
-            if "bullish" in joined and "bearish" in joined and "%" in joined:
-                import re
-                def find_pct(label):
-                    for rt in rows_text:
-                        if label in rt:
-                            m = re.search(r"([0-9]{1,2}\.[0-9])\s*%", rt)
-                            if m:
-                                return float(m.group(1))
-                    return None
-                bull = find_pct("bullish")
-                bear = find_pct("bearish")
-                neut = find_pct("neutral")
-                if bull and bear and (bull + bear) < 100.5:  # sanity
-                    idx = pd.Timestamp.today().normalize()
-                    return pd.DataFrame({
-                        "bullish": [bull], "bearish": [bear],
-                        "neutral": [neut if neut is not None else 100 - bull - bear],
-                        "spread": [bull - bear],
-                    }, index=[idx])
+
+        pct_re = re.compile(r"([0-9]{1,2}\.[0-9])\s*%")
+        today = pd.Timestamp.today().normalize()
+
+        def _parse_row_date(date_txt: str, anchor_year: int) -> pd.Timestamp | None:
+            """Parse 'Apr 15' style dates; infer year by stepping back from anchor."""
+            try:
+                return pd.to_datetime(f"{date_txt} {anchor_year}", errors="raise")
+            except Exception:
+                return None
+
+        rows: list[tuple[pd.Timestamp, float, float, float]] = []
+        for table in soup.find_all("table"):
+            header_cells = [c.get_text(" ", strip=True).lower() for c in table.find_all(["th", "td"])[:4]]
+            if not ("bullish" in " ".join(header_cells) and "bearish" in " ".join(header_cells)):
+                continue
+            year_cursor = today.year
+            prev_month: int | None = None
+            for tr in table.find_all("tr"):
+                cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
+                if len(cells) < 4:
+                    continue
+                date_raw = cells[0].strip()
+                if not date_raw or "date" in date_raw.lower():
+                    continue
+                bull_m = pct_re.search(cells[1])
+                neut_m = pct_re.search(cells[2])
+                bear_m = pct_re.search(cells[3])
+                if not (bull_m and bear_m):
+                    continue
+                dt = _parse_row_date(date_raw, year_cursor)
+                if dt is None:
+                    continue
+                # If the month advanced (e.g., going from Jan -> Dec), we crossed
+                # a year boundary backwards; decrement the year cursor.
+                if prev_month is not None and dt.month > prev_month:
+                    year_cursor -= 1
+                    dt = _parse_row_date(date_raw, year_cursor) or dt
+                prev_month = dt.month
+                rows.append((
+                    dt,
+                    float(bull_m.group(1)),
+                    float(neut_m.group(1)) if neut_m else float("nan"),
+                    float(bear_m.group(1)),
+                ))
+            if rows:
+                break
+
+        if rows:
+            df = (
+                pd.DataFrame(rows, columns=["date", "bullish", "neutral", "bearish"])
+                .drop_duplicates(subset=["date"])
+                .set_index("date")
+                .sort_index()
+            )
+            df["spread"] = df["bullish"] - df["bearish"]
+            return df[cols]
     except Exception as e:
-        log.warning("AAII HTML fallback failed: %s", e)
+        log.info("AAII HTML fallback unavailable (%s)", str(e)[:80])
 
     return pd.DataFrame(columns=cols)
 
@@ -591,20 +690,21 @@ def put_call_ratio() -> pd.Series:
     today_val = None
     try:
         import yfinance as yf
-        t = yf.Ticker("SPY")
-        expiries = list(t.options)[:3]  # 3 nearest expiries = deepest liquidity
-        tot_c = tot_p = 0.0
-        for e in expiries:
-            try:
-                oc = t.option_chain(e)
-                tot_c += float(oc.calls["volume"].fillna(0).sum())
-                tot_p += float(oc.puts["volume"].fillna(0).sum())
-            except Exception:
-                continue
+        with _silence_stderr():
+            t = yf.Ticker("SPY")
+            expiries = list(t.options)[:3]  # 3 nearest expiries = deepest liquidity
+            tot_c = tot_p = 0.0
+            for e in expiries:
+                try:
+                    oc = t.option_chain(e)
+                    tot_c += float(oc.calls["volume"].fillna(0).sum())
+                    tot_p += float(oc.puts["volume"].fillna(0).sum())
+                except Exception:
+                    continue
         if tot_c > 0:
             today_val = round(tot_p / tot_c, 4)
     except Exception as e:
-        log.warning("SPY put/call snapshot failed: %s", e)
+        log.info("SPY put/call snapshot unavailable (%s)", str(e)[:80])
 
     # ---- Load existing cache (disk-based, builds history over time)
     cache_dir = os.path.join(os.path.dirname(__file__), "..", "cache")

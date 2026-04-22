@@ -241,7 +241,17 @@ def historical_pillar_scores(raw: RawFrame) -> pd.DataFrame:
         # timestamps; resample() then reindexes and raises on duplicates, so
         # dedupe first.
         s_d = s.copy()
-        if s_d.index.tz is not None:
+        # Ensure DatetimeIndex — some fallback fetchers can emit string/int indices
+        if not isinstance(s_d.index, pd.DatetimeIndex):
+            try:
+                s_d.index = pd.to_datetime(s_d.index, errors="coerce")
+                s_d = s_d[s_d.index.notna()]
+                if s_d.empty or not isinstance(s_d.index, pd.DatetimeIndex):
+                    continue
+            except Exception:
+                continue
+        # Strip timezone for resample
+        if getattr(s_d.index, "tz", None) is not None:
             s_d.index = s_d.index.tz_localize(None)
         s_d = s_d.sort_index()
         s_d = s_d[~s_d.index.duplicated(keep="last")]
@@ -281,6 +291,108 @@ def historical_composite(raw: RawFrame) -> pd.Series:
     out = (weighted / denom).dropna()
     out.name = "composite"
     return out
+
+
+# ---------------------------------------------------------------------------
+# Exposure recommendation — map composite score + cluster to an actionable position
+# ---------------------------------------------------------------------------
+def exposure_recommendation(
+    composite_score: float,
+    cluster: dict | None = None,
+) -> dict:
+    """
+    Translate a 0-100 composite regime score (plus optional cluster state) into
+    an explicit net equity exposure + tail-hedge recommendation.
+
+    Returns dict with:
+      - net_pct      : int, suggested net long % (can exceed 100 = levered long)
+      - hedge_pct    : float, suggested notional in OTM SPX puts as % of NAV
+      - label        : short action label ("TRIM", "BACK UP TRUCK", etc.)
+      - color        : hex color for UI (matches gauge regime colors)
+      - conviction   : "High" / "Medium" / "Low"
+      - rationale    : one-line explanation
+      - cluster_override : bool — True if cluster forced a deviation from the base mapping
+
+    The rule-of-thumb mapping below is tunable. Cluster overrides:
+      - top_cluster ≥ 4    : -20pp to net, +0.5% to hedge minimum
+      - bottom_cluster ≥ 4 : +15pp to net, hedge cleared
+    """
+    if composite_score is None or (isinstance(composite_score, float) and np.isnan(composite_score)):
+        return {
+            "net_pct": None, "hedge_pct": None,
+            "label": "NO DATA", "color": "#555",
+            "conviction": "—", "rationale": "Composite unavailable.",
+            "cluster_override": False,
+        }
+
+    s = float(composite_score)
+
+    # Base mapping from composite regime → exposure
+    if s < 15:
+        base = {"net": 130, "hedge": 0.0, "label": "BACK UP THE TRUCK",  "color": "#16a085"}
+    elif s < 35:
+        base = {"net": 115, "hedge": 0.0, "label": "SCALE IN",            "color": "#27ae60"}
+    elif s < 45:
+        base = {"net": 100, "hedge": 0.0, "label": "FULLY INVESTED",      "color": "#3498db"}
+    elif s < 65:
+        base = {"net": 90,  "hedge": 0.0, "label": "STANDARD ALLOCATION", "color": "#95a5a6"}
+    elif s < 85:
+        base = {"net": 50,  "hedge": 0.5, "label": "TRIM",                "color": "#e67e22"}
+    else:
+        base = {"net": 20,  "hedge": 1.0, "label": "MAX DEFENSIVE",       "color": "#c0392b"}
+
+    net = base["net"]
+    hedge = base["hedge"]
+    label = base["label"]
+    color = base["color"]
+    cluster_override = False
+    conviction = "Low"
+
+    top_n = int(cluster.get("top_cluster_count", 0)) if cluster else 0
+    bot_n = int(cluster.get("bottom_cluster_count", 0)) if cluster else 0
+
+    # Cluster overrides — the whole point of clusters is they trump noise
+    if top_n >= 4:
+        net = max(0, net - 20)
+        hedge = max(hedge, 0.5) + 0.5  # at least 0.5%, plus 0.5 more on top
+        cluster_override = True
+        label = f"TOP CLUSTER ({top_n}) — CUT"
+        color = "#c0392b"
+        conviction = "High"
+    elif bot_n >= 4:
+        net = min(150, net + 15)
+        hedge = 0.0
+        cluster_override = True
+        label = f"BOTTOM CLUSTER ({bot_n}) — ADD"
+        color = "#16a085"
+        conviction = "High"
+    else:
+        # Conviction without cluster: extremes = Medium, mid-range = Low
+        if s < 25 or s >= 75:
+            conviction = "Medium"
+        elif 40 <= s <= 60:
+            conviction = "Low"
+        else:
+            conviction = "Medium"
+
+    rationale_bits: list[str] = []
+    if cluster_override:
+        rationale_bits.append(
+            f"{top_n or bot_n} indicators clustered at "
+            f"{'top' if top_n >= 4 else 'bottom'} — overrides base reading"
+        )
+    rationale_bits.append(f"composite {s:.0f}")
+    rationale = " · ".join(rationale_bits)
+
+    return {
+        "net_pct": int(round(net)),
+        "hedge_pct": float(hedge),
+        "label": label,
+        "color": color,
+        "conviction": conviction,
+        "rationale": rationale,
+        "cluster_override": cluster_override,
+    }
 
 
 def pillar_momentum(raw: RawFrame) -> dict:

@@ -6,5 +6,6 @@ __pycache__/
 *.xls
 *.xlsx
 cache/
+.yfinance_cache/
 .venv/
 venv/

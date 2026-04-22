@@ -47,6 +47,7 @@ from src.indicators import (
     build_raw,
     cluster_signal,
     composite,
+    exposure_recommendation,
     historical_composite,
     latest_percentile,
     orient_score,
@@ -172,8 +173,25 @@ CHART_START, CHART_END = _chart_date_bounds()
 
 
 def _normalize_series_index(s: pd.Series) -> pd.Series:
+    """
+    Return a copy of `s` with a clean, tz-naive, monotonically-sorted
+    DatetimeIndex. Defensive: some upstream fetchers occasionally emit a
+    plain `Index` (string/int) when a source returns an unexpected shape —
+    we coerce rather than crash the dashboard.
+    """
     out = s.copy()
-    if out.index.tz is not None:
+    # Coerce non-datetime indices (e.g. empty Index, object dtype from a
+    # scrape fallback) into DatetimeIndex; drop rows that don't parse.
+    if not isinstance(out.index, pd.DatetimeIndex):
+        try:
+            out.index = pd.to_datetime(out.index, errors="coerce")
+            out = out[out.index.notna()]
+        except Exception:
+            return pd.Series(dtype=out.dtype if hasattr(out, "dtype") else float)
+    if out.empty or not isinstance(out.index, pd.DatetimeIndex):
+        return out
+    # Strip timezone
+    if getattr(out.index, "tz", None) is not None:
         out.index = out.index.tz_localize(None)
     return out.sort_index()
 
@@ -325,10 +343,7 @@ def _sparkline(series: pd.Series, *, bad_direction: str = "up", height: int = 38
     """Tiny trend chart — 60-day history, no axes, color by net change over window."""
     if series is None or series.empty or len(series) < 2:
         return None
-    s = series.copy()
-    if s.index.tz is not None:
-        s.index = s.index.tz_localize(None)
-    s = s.sort_index().dropna().tail(60)
+    s = _normalize_series_index(series).dropna().tail(60)
     if s.empty:
         return None
     chg = s.iloc[-1] - s.iloc[0]
@@ -397,13 +412,27 @@ def _metric_tile(
 composite_score = comp["composite"]
 label, emoji, color = regime_label(composite_score) if not np.isnan(composite_score) else ("NO DATA", "?", "#555")
 
+# Actionable: map composite + cluster → suggested net exposure + hedge
+exp_rec = exposure_recommendation(composite_score, cluster)
+
+# Trend: what was our suggested exposure ~5 business days ago?
+prev_exp = None
+prev_score = np.nan
+try:
+    if comp_hist is not None and not comp_hist.empty and len(comp_hist) >= 6:
+        prev_score = float(comp_hist.iloc[-6])  # ~1 week back (5 business days)
+        if not np.isnan(prev_score):
+            prev_exp = exposure_recommendation(prev_score, cluster=None)
+except Exception:
+    prev_exp = None
+
 
 # ---------------------------------------------------------------------------
 # HEADER — the "daily glance"
 # ---------------------------------------------------------------------------
 st.markdown(f"## Market Regime — {datetime.now().strftime('%A, %b %d %Y')}")
 
-hc1, hc2, hc3, hc4 = st.columns([1.4, 1, 1, 1.2])
+hc1, hc_exp, hc2, hc3, hc4 = st.columns([1.25, 1.4, 0.95, 0.95, 1.0])
 
 with hc1:
     st.markdown("**Composite Regime Score**")
@@ -445,6 +474,79 @@ with hc1:
         f"<b>{label}</b></div>",
         unsafe_allow_html=True,
     )
+
+with hc_exp:
+    st.markdown("**Recommended Exposure**")
+    if exp_rec["net_pct"] is None:
+        st.markdown(
+            "<div style='text-align:center; color:#888; padding:40px 0;'>No data</div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        net_pct = exp_rec["net_pct"]
+        hedge_pct = exp_rec["hedge_pct"]
+        exp_color = exp_rec["color"]
+        exp_label = exp_rec["label"]
+        conviction = exp_rec["conviction"]
+        override = exp_rec["cluster_override"]
+
+        # Hedge text
+        hedge_txt = "None" if hedge_pct <= 0 else f"{hedge_pct:.1f}% OTM puts"
+        hedge_color = "#888" if hedge_pct <= 0 else "#e67e22"
+
+        # Trend vs 1 week ago
+        trend_html = ""
+        if prev_exp is not None and prev_exp["net_pct"] is not None:
+            delta = net_pct - prev_exp["net_pct"]
+            if delta == 0:
+                trend_html = f"Unchanged vs 1w ago ({prev_exp['net_pct']}%)"
+            elif delta > 0:
+                trend_html = f"<span style='color:#4fc978;'>▲ +{delta}pp</span> vs 1w ago (was {prev_exp['net_pct']}%)"
+            else:
+                trend_html = f"<span style='color:#ff6b6b;'>▼ {delta}pp</span> vs 1w ago (was {prev_exp['net_pct']}%)"
+        elif not np.isnan(prev_score):
+            trend_html = f"1w-ago composite: {prev_score:.0f}"
+
+        override_badge = (
+            "<div style='display:inline-block; background:#c0392b; color:#fff; "
+            "font-size:0.7rem; font-weight:700; padding:3px 8px; border-radius:4px; "
+            "margin-bottom:8px; letter-spacing:0.5px;'>⚠ CLUSTER OVERRIDE</div>"
+            if override else ""
+        )
+
+        # Pull rgb for soft glow
+        r = int(exp_color[1:3], 16)
+        g = int(exp_color[3:5], 16)
+        b = int(exp_color[5:7], 16)
+
+        st.markdown(
+            f"""
+<div style='background: linear-gradient(180deg, #1a1d29 0%, #121520 100%);
+            border-radius: 12px;
+            padding: 16px 14px;
+            border: 2px solid {exp_color};
+            text-align: center;
+            box-shadow: 0 0 24px rgba({r},{g},{b},0.25);
+            min-height: 296px;'>
+  {override_badge}
+  <div style='font-size: 2.9rem; font-weight: 800; color: {exp_color}; line-height: 1; margin: 4px 0 4px 0; white-space: nowrap;'>
+    {net_pct}%
+  </div>
+  <div style='font-size: 0.72rem; color: #aaa; letter-spacing: 1px; margin-bottom: 10px;'>
+    NET EQUITY EXPOSURE
+  </div>
+  <div style='font-size: 0.95rem; color: #fff; font-weight: 700; margin-bottom: 12px; line-height: 1.2;'>
+    {exp_label}
+  </div>
+  <div style='font-size: 0.8rem; color: #ccc; line-height: 1.6; text-align: left; padding: 0 4px;'>
+    <div>Hedge: <b style='color:{hedge_color};'>{hedge_txt}</b></div>
+    <div>Conviction: <b>{conviction}</b></div>
+    <div style='margin-top: 6px; color: #888; font-size: 0.74rem; line-height: 1.4;'>{trend_html}</div>
+  </div>
+</div>
+""",
+            unsafe_allow_html=True,
+        )
 
 with hc2:
     _metric_tile(
@@ -504,12 +606,12 @@ with hc4:
     tcnt = cluster["top_cluster_count"]
     bcnt = cluster["bottom_cluster_count"]
     if tcnt >= 4:
-        st.error(f"TOP CLUSTER: {tcnt} indicators in extreme complacency")
+        st.error(f"TOP CLUSTER · {tcnt} ≥85")
     elif bcnt >= 4:
-        st.success(f"BOTTOM CLUSTER: {bcnt} indicators in extreme fear")
+        st.success(f"BOTTOM CLUSTER · {bcnt} ≤15")
     else:
-        st.info(f"No extreme cluster ({tcnt} top / {bcnt} bottom)")
-    st.caption("Funds act on 3–5+ aligned extremes, not single signals.")
+        st.info(f"No cluster · {tcnt}↑ / {bcnt}↓")
+    st.caption(f"Indicators at extreme: **{tcnt}** top-risk, **{bcnt}** panic. Clusters of 4+ are actionable.")
 
 
 # ---------------------------------------------------------------------------
@@ -785,7 +887,9 @@ st.caption(
 if "ts_marker_date" not in st.session_state:
     st.session_state.ts_marker_date = None
 
-_m1, _m2, _m3, _m4 = st.columns([1.15, 0.85, 0.85, 2.2])
+st.markdown("**Highlight date** — drop a red marker on every chart below")
+
+_m1, _m2, _m3, _m4 = st.columns([1.1, 0.75, 0.75, 2.0], gap="small", vertical_alignment="center")
 with _m1:
     _pick = st.date_input(
         "Highlight date",
@@ -793,24 +897,39 @@ with _m1:
         min_value=CHART_START.date(),
         max_value=CHART_END.date(),
         key="ts_marker_date_picker",
+        label_visibility="collapsed",
     )
 with _m2:
-    if st.button("Set marker", key="ts_marker_set", width="stretch", help="Place a red dot on all charts at this date"):
+    if st.button("Set", key="ts_marker_set", width="stretch", help="Place a red dot on all charts at this date"):
         st.session_state.ts_marker_date = pd.Timestamp(_pick).normalize()
 with _m3:
-    if st.button("Clear marker", key="ts_marker_clear", width="stretch"):
+    if st.button("Clear", key="ts_marker_clear", width="stretch", help="Remove the marker from all charts"):
         st.session_state.ts_marker_date = None
 with _m4:
     _md = st.session_state.ts_marker_date
     if _md is not None:
-        st.success(f"Marker: **{_md.strftime('%Y-%m-%d')}** — red dot on each series (change date + Set again to move)")
+        st.markdown(
+            f"<div style='color:#4fc978; font-size:0.85rem; padding:4px 0;'>"
+            f"● Marker set: <b>{_md.strftime('%Y-%m-%d')}</b> — red dot on each series. "
+            f"Change date + Set again to move.</div>",
+            unsafe_allow_html=True,
+        )
     else:
-        st.caption("No marker — choose a date and click **Set marker**.")
+        st.markdown(
+            "<div style='color:#888; font-size:0.85rem; padding:4px 0;'>"
+            "No marker — choose a date and click <b>Set marker</b>.</div>",
+            unsafe_allow_html=True,
+        )
 
 ts_marker: pd.Timestamp | None = st.session_state.ts_marker_date
 
+# Paired left<->right by theme so each row reads as a side-by-side comparison.
+# 11 charts split 6+5 — the orphan (% SP500 above 200DMA) sits at the bottom
+# of the LEFT column so any trailing empty space falls on the right (the eye
+# expects the left to extend further and tolerates a right-side gap better).
 rc1, rc2 = st.columns(2)
 with rc1:
+    # Row 1 — credit stress (pairs with Fed liquidity)
     _line(
         raw.series.get("hy_spread"),
         "HY Credit Spread (%)",
@@ -818,6 +937,7 @@ with rc1:
         indicator_key="hy_spread",
         marker_ts=ts_marker,
     )
+    # Row 2 — equity vol (pairs with tail-risk SKEW)
     _line(
         raw.series.get("vix"),
         "VIX",
@@ -825,20 +945,7 @@ with rc1:
         indicator_key="vix",
         marker_ts=ts_marker,
     )
-    _line(
-        raw.series.get("fear_greed"),
-        "CNN Fear & Greed",
-        ref_lines=[(25, "extreme fear"), (75, "extreme greed")],
-        indicator_key="fear_greed",
-        marker_ts=ts_marker,
-    )
-    _line(
-        raw.series.get("aaii_bull_bear"),
-        "AAII Bull−Bear Spread (%)",
-        ref_lines=[(-20, "panic"), (20, "euphoria")],
-        indicator_key="aaii_bull_bear",
-        marker_ts=ts_marker,
-    )
+    # Row 3 — cross-asset divergence (pairs with cross-asset correlation)
     _line(
         raw.series.get("move_vix_div"),
         "MOVE / VIX  (bond-vol vs equity-vol)",
@@ -846,15 +953,23 @@ with rc1:
         extra_direction="risk_high_is_top",
         marker_ts=ts_marker,
     )
-
-with rc2:
-    nl = raw.series.get("net_liquidity")
+    # Row 4 — retail sentiment (pairs with manager sentiment)
     _line(
-        nl,
-        "Fed Net Liquidity (WALCL − TGA − RRP, $B)",
-        indicator_key="net_liquidity",
+        raw.series.get("fear_greed"),
+        "CNN Fear & Greed",
+        ref_lines=[(25, "extreme fear"), (75, "extreme greed")],
+        indicator_key="fear_greed",
         marker_ts=ts_marker,
     )
+    # Row 5 — survey positioning (pairs with futures positioning)
+    _line(
+        raw.series.get("aaii_bull_bear"),
+        "AAII Bull−Bear Spread (%)",
+        ref_lines=[(-20, "panic"), (20, "euphoria")],
+        indicator_key="aaii_bull_bear",
+        marker_ts=ts_marker,
+    )
+    # Row 6 — breadth (orphan; no right-side pair)
     _line(
         raw.series.get("pct_above_200dma"),
         "% SP500 above 200DMA",
@@ -862,13 +977,17 @@ with rc2:
         indicator_key="pct_above_200dma",
         marker_ts=ts_marker,
     )
+
+with rc2:
+    # Row 1 — liquidity (pairs with credit stress)
+    nl = raw.series.get("net_liquidity")
     _line(
-        raw.series.get("naaim"),
-        "NAAIM Exposure",
-        ref_lines=[(30, "defensive"), (100, "leveraged")],
-        indicator_key="naaim",
+        nl,
+        "Fed Net Liquidity (WALCL − TGA − RRP, $B)",
+        indicator_key="net_liquidity",
         marker_ts=ts_marker,
     )
+    # Row 2 — tail-risk (pairs with VIX)
     _line(
         raw.series.get("skew"),
         "CBOE SKEW",
@@ -876,6 +995,7 @@ with rc2:
         indicator_key="skew",
         marker_ts=ts_marker,
     )
+    # Row 3 — cross-asset correlation (pairs with MOVE/VIX divergence)
     _line(
         raw.series.get("corr_cluster"),
         "SPY vs (TLT+GLD)/2  20D correlation",
@@ -883,6 +1003,15 @@ with rc2:
         extra_direction="risk_high_is_top",
         marker_ts=ts_marker,
     )
+    # Row 4 — manager sentiment (pairs with retail F&G)
+    _line(
+        raw.series.get("naaim"),
+        "NAAIM Exposure",
+        ref_lines=[(30, "defensive"), (100, "leveraged")],
+        indicator_key="naaim",
+        marker_ts=ts_marker,
+    )
+    # Row 5 — futures positioning (pairs with AAII survey)
     _line(
         raw.series.get("cta_positioning"),
         "CTA Net Long — CFTC Leveraged Funds, S&P 500 E-mini (% of OI)",
