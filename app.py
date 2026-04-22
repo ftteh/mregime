@@ -114,7 +114,7 @@ with st.sidebar:
             "(NAAIM + F&G + VIX + SKEW already cover sentiment.)"
         )
 
-    if st.button("Refresh data", use_container_width=True):
+    if st.button("Refresh data", width="stretch"):
         st.cache_data.clear()
         st.rerun()
 
@@ -296,7 +296,7 @@ def _line(
         ),
         yaxis=dict(gridcolor="rgba(255,255,255,0.08)"),
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 
 composite_score = comp["composite"]
@@ -344,7 +344,7 @@ with hc1:
         paper_bgcolor="rgba(0,0,0,0)",
         font=dict(color="white"),
     )
-    st.plotly_chart(gauge, use_container_width=True)
+    st.plotly_chart(gauge, width="stretch")
     st.markdown(
         f"<div style='text-align:center;'><span class='pill' style='background:{color}'>{emoji}</span>"
         f"<b>{label}</b></div>",
@@ -502,7 +502,7 @@ styled = tbl[display_cols].rename(columns={
     "n_obs": "Obs",
 }).style.map(_highlight_score, subset=["Top-risk score"])
 
-st.dataframe(styled, use_container_width=True, hide_index=True)
+st.dataframe(styled, width="stretch", hide_index=True)
 
 
 # ---------------------------------------------------------------------------
@@ -590,7 +590,7 @@ def _render_spx_regime_overlay() -> None:
         ),
         yaxis=dict(gridcolor="rgba(255,255,255,0.08)", title="SPX"),
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 
 # ts_marker is defined below in the time-series grid block; we need it here too.
@@ -622,10 +622,10 @@ with _m1:
         key="ts_marker_date_picker",
     )
 with _m2:
-    if st.button("Set marker", key="ts_marker_set", use_container_width=True, help="Place a red dot on all charts at this date"):
+    if st.button("Set marker", key="ts_marker_set", width="stretch", help="Place a red dot on all charts at this date"):
         st.session_state.ts_marker_date = pd.Timestamp(_pick).normalize()
 with _m3:
-    if st.button("Clear marker", key="ts_marker_clear", use_container_width=True):
+    if st.button("Clear marker", key="ts_marker_clear", width="stretch"):
         st.session_state.ts_marker_date = None
 with _m4:
     _md = st.session_state.ts_marker_date
@@ -856,7 +856,7 @@ with st.expander("Data sources & methodology"):
          "Direction": i.direction, "Note": i.description}
         for i in INDICATORS
     ]
-    st.dataframe(pd.DataFrame(src_rows), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(src_rows), width="stretch", hide_index=True)
     st.markdown(
         "**Scoring**: every indicator is converted to a 3-year rolling percentile, "
         "oriented so 100 = complacency / top-risk and 0 = panic / bottom-setup. "
