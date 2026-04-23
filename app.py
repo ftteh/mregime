@@ -880,11 +880,31 @@ ts_marker = st.session_state.get("ts_marker_date", None)
 # waiting for the 1-hour load_all cache to expire.
 @st.cache_data(ttl=60 * 60, show_spinner=False)
 def _lazy_index_series(which: str) -> pd.Series:
+    """
+    Fetch RUT / IXIC for charts when the cached RawFrame is stale.
+    Prefer src.data helpers when present; fall back to yf_series on older
+    deploys that do not yet define russell2000() / nasdaq_composite().
+    """
     from src import data as _D
+
+    def _rut() -> pd.Series:
+        fn = getattr(_D, "russell2000", None)
+        if callable(fn):
+            return fn()
+        yf = getattr(_D, "yf_series", None)
+        return yf("^RUT") if callable(yf) else pd.Series(dtype=float)
+
+    def _ixic() -> pd.Series:
+        fn = getattr(_D, "nasdaq_composite", None)
+        if callable(fn):
+            return fn()
+        yf = getattr(_D, "yf_series", None)
+        return yf("^IXIC") if callable(yf) else pd.Series(dtype=float)
+
     if which == "russell2000":
-        return _D.russell2000()
+        return _rut()
     if which == "nasdaq":
-        return _D.nasdaq_composite()
+        return _ixic()
     return pd.Series(dtype=float)
 
 
