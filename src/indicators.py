@@ -127,6 +127,8 @@ def build_raw() -> RawFrame:
     s["dix"] = D.dix_proxy()
     s["cta_positioning"] = D.cftc_cta_positioning()
     s["spx"] = spx_px
+    s["russell2000"] = D.russell2000()
+    s["nasdaq"] = D.nasdaq_composite()
 
     # ---- VIX term structure
     s["vix_term_9d_1m"] = D.vix_term_9d_1m()

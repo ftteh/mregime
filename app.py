@@ -781,16 +781,8 @@ st.dataframe(styled, width="stretch", hide_index=True)
 
 
 # ---------------------------------------------------------------------------
-# SPX + HISTORICAL REGIME OVERLAY
+# MAJOR INDICES + HISTORICAL REGIME OVERLAY
 # ---------------------------------------------------------------------------
-st.markdown("### SPX with historical regime bands")
-st.caption(
-    "Background color = composite regime on that day (same scale as the gauge). "
-    "Lets you eyeball every past top/bottom call at once: red bands before drawdowns, "
-    "green bands before rallies."
-)
-
-
 def _regime_color_for_score(v: float) -> str:
     if np.isnan(v):
         return "rgba(127,127,127,0.0)"
@@ -803,21 +795,31 @@ def _regime_color_for_score(v: float) -> str:
     return            "rgba( 22,160,133, 0.22)"
 
 
-def _render_spx_regime_overlay() -> None:
-    spx_full = raw.series.get("spx", pd.Series(dtype=float))
-    if spx_full is None or spx_full.empty or comp_hist is None or comp_hist.empty:
+def _render_index_regime_overlay(
+    section_title: str,
+    price_full: pd.Series | None,
+    trace_name: str,
+    yaxis_title: str,
+) -> None:
+    st.markdown(f"### {section_title}")
+    st.caption(
+        "Background color = composite regime on that day (same scale as the gauge). "
+        "Lets you eyeball every past top/bottom call at once: red bands before drawdowns, "
+        "green bands before rallies."
+    )
+    if price_full is None or price_full.empty or comp_hist is None or comp_hist.empty:
         st.info("Not enough history yet to render regime bands.")
         return
 
-    spx_plot = _clip_series_to_chart_window(spx_full)
+    price_plot = _clip_series_to_chart_window(price_full)
     comp_plot = _normalize_series_index(comp_hist)
     comp_plot = comp_plot.loc[(comp_plot.index >= CHART_START) & (comp_plot.index <= CHART_END)]
-    if spx_plot.empty or comp_plot.empty:
+    if price_plot.empty or comp_plot.empty:
         st.info("Not enough history in chart window.")
         return
 
-    # Align composite onto SPX trading calendar so bands line up
-    comp_aligned = comp_plot.reindex(spx_plot.index, method="ffill")
+    # Align composite onto this index's trading calendar so bands line up
+    comp_aligned = comp_plot.reindex(price_plot.index, method="ffill")
 
     # Collapse consecutive same-color days into single vrects for performance
     colors = comp_aligned.apply(_regime_color_for_score)
@@ -841,13 +843,13 @@ def _render_spx_regime_overlay() -> None:
         fig.add_vrect(x0=x0, x1=x1, fillcolor=col, line_width=0, layer="below")
 
     fig.add_trace(go.Scatter(
-        x=spx_plot.index, y=spx_plot.values,
-        mode="lines", name="SPX",
+        x=price_plot.index, y=price_plot.values,
+        mode="lines", name=trace_name,
         line=dict(color="#f5f5f5", width=1.8),
-        hovertemplate="%{x|%Y-%m-%d}<br>SPX %{y:,.2f}<extra></extra>",
+        hovertemplate=f"%{{x|%Y-%m-%d}}<br>{trace_name} %{{y:,.2f}}<extra></extra>",
     ))
     if ts_marker is not None:
-        _add_chart_date_marker(fig, spx_plot, ts_marker)
+        _add_chart_date_marker(fig, price_plot, ts_marker)
 
     fig.update_layout(
         height=380,
@@ -863,7 +865,7 @@ def _render_spx_regime_overlay() -> None:
             range=[CHART_START, CHART_END],
             type="date",
         ),
-        yaxis=dict(gridcolor="rgba(255,255,255,0.08)", title="SPX"),
+        yaxis=dict(gridcolor="rgba(255,255,255,0.08)", title=yaxis_title),
     )
     st.plotly_chart(fig, width="stretch")
 
@@ -871,7 +873,41 @@ def _render_spx_regime_overlay() -> None:
 # ts_marker is defined below in the time-series grid block; we need it here too.
 # Grab it from session state so the marker lines up across all charts.
 ts_marker = st.session_state.get("ts_marker_date", None)
-_render_spx_regime_overlay()
+
+
+# Lazy fetch: if the cached RawFrame predates these indices being added,
+# pull them directly (cheap yfinance call) so the chart works without
+# waiting for the 1-hour load_all cache to expire.
+@st.cache_data(ttl=60 * 60, show_spinner=False)
+def _lazy_index_series(which: str) -> pd.Series:
+    from src import data as _D
+    if which == "russell2000":
+        return _D.russell2000()
+    if which == "nasdaq":
+        return _D.nasdaq_composite()
+    return pd.Series(dtype=float)
+
+
+def _index_series(key: str) -> pd.Series:
+    s = raw.series.get(key, pd.Series(dtype=float))
+    if s is None or s.empty:
+        s = _lazy_index_series(key)
+    return s if s is not None else pd.Series(dtype=float)
+
+
+_render_index_regime_overlay("SPX with historical regime bands", raw.series.get("spx", pd.Series(dtype=float)), "SPX", "SPX")
+_render_index_regime_overlay(
+    "Russell 2000 with historical regime bands",
+    _index_series("russell2000"),
+    "Russell 2000",
+    "RUT",
+)
+_render_index_regime_overlay(
+    "Nasdaq Composite with historical regime bands",
+    _index_series("nasdaq"),
+    "Nasdaq",
+    "IXIC",
+)
 
 
 # ---------------------------------------------------------------------------

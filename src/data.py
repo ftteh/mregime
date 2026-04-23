@@ -197,6 +197,16 @@ def spx() -> pd.Series:
     return yf_series("^GSPC")
 
 
+def russell2000() -> pd.Series:
+    """Russell 2000 index (^RUT)."""
+    return yf_series("^RUT")
+
+
+def nasdaq_composite() -> pd.Series:
+    """Nasdaq Composite index (^IXIC)."""
+    return yf_series("^IXIC")
+
+
 def vix9d() -> pd.Series:
     """CBOE 9-day volatility index. Not on yfinance for all ranges; falls back empty."""
     return yf_series("^VIX9D")
