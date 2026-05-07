@@ -232,6 +232,42 @@ INDICATORS: list[IndicatorSpec] = [
         direction="risk_high_is_top",
         description="Global growth proxy. High ratio = growth strong / risk-on euphoria (top risk). Low ratio = growth fears / risk-off (bottom). Leads HY spreads by 1-2 months.",
     ),
+
+    # 10. Interbank Funding Stress (Repo Market / FRA-OIS)
+    IndicatorSpec(
+        key="fra_ois_spread", label="Funding Stress Spread (CP-TBill proxy)",
+        bucket="credit_liquidity", source="FRED:SOFR90DAYAVG/DTB3/DCPF3M",
+        direction="contrarian_high_is_top",
+        description="Post-LIBOR interbank stress proxy: SOFR 90D avg vs T-Bill or CP-TBill spread. Replaces FRA-OIS (LIBOR discontinued 2023). Elevated = funding stress = bottom setup.",
+    ),
+    IndicatorSpec(
+        key="sofr_spread", label="SOFR Spread (vs Effective Fed Funds)",
+        bucket="credit_liquidity", source="FRED:SOFR/DFF",
+        direction="contrarian_high_is_top",
+        description="SOFR vs Fed Funds spread. Elevated = repo market stress / collateral scarcity (Q4 2019, March 2020). High = liquidity squeeze = bottom regime.",
+    ),
+
+    # 11. Gamma Exposure (GEX) - Options Market Structure
+    IndicatorSpec(
+        key="gamma_exposure", label="Gamma Exposure (GEX) Proxy",
+        bucket="sentiment_positioning", source="computed: SPY options chain",
+        direction="risk_high_is_top",
+        description="Estimated dealer gamma exposure from SPY options. Deep negative GEX = market makers forced to sell into weakness (crash accelerant). Extreme negative = capitulation = bottom. Positive = stability.",
+    ),
+    IndicatorSpec(
+        key="gamma_flip_zone", label="Gamma Flip Zone Distance (%)",
+        bucket="sentiment_positioning", source="computed: SPY gamma zero-crossing",
+        direction="contrarian_high_is_top",
+        description="Distance to 'zero gamma' price where dealer hedging flips from buy-to-sell to sell-to-buy. Near/past flip = volatility expansion = bottom risk.",
+    ),
+
+    # 12. Enhanced Institutional Positioning
+    IndicatorSpec(
+        key="index_put_call", label="Index Put/Call Ratio (Institutional Hedging)",
+        bucket="sentiment_positioning", source="computed: Index options",
+        direction="contrarian_high_is_top",
+        description="Institutions hedge portfolios with index puts (not equity puts). Spike = panic hedging by smart money. Extreme spike then rapid drop = hedges monetized = bottom.",
+    ),
 ]
 
 INDICATORS_BY_KEY = {i.key: i for i in INDICATORS}

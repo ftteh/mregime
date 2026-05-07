@@ -827,10 +827,13 @@ def move_vs_vix_spread() -> pd.Series:
     return ratio
 
 
-def dix_proxy() -> pd.Series:
+def _squeezemetrics_csv() -> pd.DataFrame:
     """
-    True DIX requires squeezemetrics.com (their public daily CSV is free but fragile).
-    We try the SqueezeMetrics free CSV, else return empty.
+    Fetch the SqueezeMetrics public CSV. Returns DataFrame with date index
+    and columns for dix, gex (if present). Cached to avoid repeat calls.
+
+    The free endpoint was paywalled in late 2024 ($720/mo). We try it
+    anyway — if it returns data, great; if not, we fall back gracefully.
     """
     urls = [
         "https://squeezemetrics.com/monitor/static/DIX.csv",
@@ -838,16 +841,46 @@ def dix_proxy() -> pd.Series:
     for url in urls:
         try:
             r = requests.get(url, headers=UA, timeout=10)
-            if r.ok and "," in r.text:
+            if r.ok and "," in r.text and len(r.text) > 100:
                 df = pd.read_csv(io.StringIO(r.text))
                 df.columns = [c.strip().lower() for c in df.columns]
-                df["date"] = pd.to_datetime(df["date"])
-                s = df.set_index("date")["dix"].astype(float)
-                s.name = "dix"
-                return s
+                if "date" in df.columns:
+                    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+                    df = df.dropna(subset=["date"]).set_index("date").sort_index()
+                    return df
         except Exception as e:
-            log.warning("DIX fetch failed: %s", e)
+            log.info("SqueezeMetrics CSV fetch failed: %s", e)
+    return pd.DataFrame()
+
+
+def dix_proxy() -> pd.Series:
+    """
+    Dark Index (DIX) — proportion of dark pool volume that is buying.
+    Rising DIX during a sell-off = institutional accumulation.
+
+    Source: SqueezeMetrics free CSV (may be paywalled).
+    """
+    df = _squeezemetrics_csv()
+    if not df.empty and "dix" in df.columns:
+        s = df["dix"].astype(float).dropna()
+        s.name = "dix"
+        return s
     return pd.Series(dtype=float, name="dix")
+
+
+def squeezemetrics_gex() -> pd.Series:
+    """
+    GEX (Gamma Exposure) from SqueezeMetrics — historical daily series.
+    Much richer history than our options-chain proxy (goes back to 2011).
+
+    Falls back to our computed proxy if SqueezeMetrics is unavailable.
+    """
+    df = _squeezemetrics_csv()
+    if not df.empty and "gex" in df.columns:
+        s = df["gex"].astype(float).dropna()
+        s.name = "gamma_exposure"
+        return s
+    return pd.Series(dtype=float, name="gamma_exposure")
 
 
 # ---------------------------------------------------------------------------
@@ -982,6 +1015,314 @@ def hy_spread_velocity(lookback_days: int = 20) -> pd.Series:
     vel = bps - bps.shift(lookback_days)
     vel.name = "hy_spread_velocity"
     return vel.dropna()
+
+
+# ---------------------------------------------------------------------------
+# Interbank Funding / Repo Market (FRA-OIS, SOFR)
+# ---------------------------------------------------------------------------
+def fra_ois_spread() -> pd.Series:
+    """
+    Interbank funding stress proxy.
+
+    The classic FRA-OIS spread is not available on FRED, and LIBOR was
+    permanently discontinued in 2023. We construct a post-LIBOR equivalent:
+
+    Primary: SOFR 90-Day Average (SOFR90DAYAVG) minus 3-Month Treasury Bill
+             rate (DTB3). This captures the secured-vs-unsecured funding gap
+             that FRA-OIS used to measure. Elevated = funding stress.
+
+    Fallback: 3-Month AA Financial Commercial Paper Rate (DCPF3M) minus
+              3-Month Treasury Bill (DTB3). CP-Treasury spread is the closest
+              surviving proxy for interbank credit risk (a la TED spread).
+
+    Output is in basis points. Normal < 20bps. Crisis > 50bps.
+    """
+    # Path 1: SOFR 90D avg vs 3M T-Bill
+    sofr90 = _fred("SOFR90DAYAVG")
+    tbill3m = _fred("DTB3")
+
+    if not sofr90.empty and not tbill3m.empty:
+        df = pd.concat([sofr90.rename("sofr90"), tbill3m.rename("tbill")], axis=1).ffill().dropna()
+        if not df.empty and len(df) > 30:
+            spread = (df["sofr90"] - df["tbill"]) * 100.0  # percent -> bps
+            spread.name = "fra_ois_spread"
+            return spread.dropna()
+
+    # Path 2: Financial CP vs T-Bill (TED-like proxy)
+    cp3m = _fred("DCPF3M")  # 3M AA Financial Commercial Paper rate
+    if not cp3m.empty and not tbill3m.empty:
+        df = pd.concat([cp3m.rename("cp"), tbill3m.rename("tbill")], axis=1).ffill().dropna()
+        if not df.empty and len(df) > 30:
+            spread = (df["cp"] - df["tbill"]) * 100.0
+            spread.name = "fra_ois_spread"
+            return spread.dropna()
+
+    # Path 3: A2/P2 minus AA CP spread (pure credit risk tier spread)
+    cp_a2p2 = _fred("DCPN3M")  # 3M A2/P2 Nonfinancial CP
+    cp_aa = _fred("DCPF3M")    # 3M AA Financial CP
+    if not cp_a2p2.empty and not cp_aa.empty:
+        df = pd.concat([cp_a2p2.rename("low"), cp_aa.rename("high")], axis=1).ffill().dropna()
+        if not df.empty:
+            spread = (df["low"] - df["high"]) * 100.0
+            spread.name = "fra_ois_spread"
+            return spread.dropna()
+
+    return pd.Series(dtype=float, name="fra_ois_spread")
+
+
+def sofr_spread() -> pd.Series:
+    """
+    SOFR (Secured Overnight Financing Rate) spread vs Effective Fed Funds.
+    Elevated SOFR = repo market stress / collateral scarcity.
+
+    Notable spikes:
+    - Sept 2019: Repo crisis (SOFR ~5% above Fed Funds)
+    - March 2020: COVID liquidity freeze
+    """
+    sofr = _fred("SOFR")  # Overnight secured rate
+    effr = _fred("EFFR")  # Effective Fed Funds Rate
+
+    if sofr.empty or effr.empty:
+        return pd.Series(dtype=float, name="sofr_spread")
+
+    df = pd.concat([sofr.rename("sofr"), effr.rename("effr")], axis=1).dropna()
+    if df.empty:
+        return pd.Series(dtype=float, name="sofr_spread")
+
+    # Spread in basis points
+    spread = (df["sofr"] - df["effr"]) * 100
+    spread.name = "sofr_spread"
+    return spread.dropna()
+
+
+# ---------------------------------------------------------------------------
+# Gamma Exposure (GEX) - Options Market Structure
+# ---------------------------------------------------------------------------
+def _cache_path(filename: str) -> str:
+    """Return full path for a cache file."""
+    cache_dir = os.path.join(os.path.dirname(__file__), "..", "cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    return os.path.join(cache_dir, filename)
+
+
+def _load_cache(filename: str, col_name: str) -> pd.Series:
+    """Load a cached time series from CSV."""
+    path = _cache_path(filename)
+    if os.path.exists(path):
+        try:
+            df = pd.read_csv(path, parse_dates=["date"])
+            return df.set_index("date")[col_name]
+        except Exception:
+            return pd.Series(dtype=float, name=col_name)
+    return pd.Series(dtype=float, name=col_name)
+
+
+def _save_cache(filename: str, series: pd.Series, col_name: str):
+    """Save a time series to CSV cache."""
+    path = _cache_path(filename)
+    try:
+        series.to_frame(col_name).reset_index().rename(columns={"index": "date"}).to_csv(path, index=False)
+    except Exception as e:
+        log.warning("Cache write failed for %s: %s", filename, e)
+
+
+def gamma_exposure_proxy() -> pd.Series:
+    """
+    Gamma Exposure (GEX) — estimated dealer gamma.
+
+    Strategy:
+    1. Try SqueezeMetrics historical GEX (daily, back to 2011 if available)
+    2. Fall back to live computation from SPY options chain + cache
+
+    When GEX is:
+    - Deeply negative: Dealers must sell into weakness = crash accelerant
+    - Positive: Dealers buy dips, sell rips = stabilizing
+    """
+    import yfinance as yf
+
+    # Try SqueezeMetrics first (has years of history)
+    sqz = squeezemetrics_gex()
+    if not sqz.empty and len(sqz) > 30:
+        return sqz
+
+    # Fall back to live computation + disk cache
+    hist = _load_cache("gamma_exposure_history.csv", "gamma_exposure")
+
+    today_val = None
+    try:
+        with _silence_stderr():
+            t = yf.Ticker("SPY")
+            spot = t.info.get("regularMarketPrice", t.info.get("previousClose", 0))
+            if not spot:
+                spot_hist = t.history(period="5d")["Close"].iloc[-1]
+                spot = float(spot_hist)
+
+            all_expiries = list(t.options)
+            near_expiries = [e for e in all_expiries[:4] if e]
+
+            total_gamma = 0.0
+            total_dollars = 0.0
+
+            for expiry in near_expiries:
+                try:
+                    chain = t.option_chain(expiry)
+                    calls = chain.calls
+                    puts = chain.puts
+
+                    for _, row in calls.iterrows():
+                        strike = row["strike"]
+                        oi = row.get("openInterest", 0) or 0
+                        if oi > 0:
+                            moneyness = abs(strike - spot) / spot
+                            gamma_weight = oi * max(0.1, 1 - moneyness * 5)
+                            total_gamma += gamma_weight * 0.01
+                            total_dollars += oi * row.get("lastPrice", 0) * 100
+
+                    for _, row in puts.iterrows():
+                        strike = row["strike"]
+                        oi = row.get("openInterest", 0) or 0
+                        if oi > 0:
+                            moneyness = abs(strike - spot) / spot
+                            gamma_weight = oi * max(0.1, 1 - moneyness * 5)
+                            if strike < spot:
+                                total_gamma -= gamma_weight * 0.02
+                            total_dollars += oi * row.get("lastPrice", 0) * 100
+
+                except Exception:
+                    continue
+
+            if total_dollars > 0:
+                today_val = total_gamma / 1e9
+
+    except Exception as e:
+        log.info("Gamma exposure calculation failed: %s", str(e)[:80])
+
+    if today_val is not None:
+        today = pd.Timestamp.today().normalize()
+        hist.loc[today] = today_val
+        hist = hist[~hist.index.duplicated(keep="last")].sort_index()
+        _save_cache("gamma_exposure_history.csv", hist, "gamma_exposure")
+
+    hist.name = "gamma_exposure"
+    return hist
+
+
+def gamma_flip_zone_distance() -> pd.Series:
+    """
+    Distance (in % terms) to the estimated 'gamma flip' price level.
+
+    The gamma flip zone is where net gamma exposure crosses zero.
+    Above flip = positive gamma (dealers sell highs, buy lows) = stable.
+    Below flip = negative gamma (dealers sell lows, buy highs) = unstable.
+
+    Returns % distance from current price to estimated flip zone.
+    Positive = distance above flip (safe), Negative = below flip (danger).
+    Cached to build history over time.
+    """
+    import yfinance as yf
+
+    # Load existing cache
+    hist = _load_cache("gamma_flip_history.csv", "gamma_flip")
+
+    # Compute today's value
+    today_val = None
+    try:
+        with _silence_stderr():
+            t = yf.Ticker("SPY")
+            spot = t.info.get("regularMarketPrice", t.info.get("previousClose", 0))
+            if not spot:
+                px_hist = t.history(period="5d")["Close"].iloc[-1]
+                spot = float(px_hist)
+
+            # Estimate flip zone from option open interest distribution
+            all_expiries = list(t.options)
+            if not all_expiries:
+                return hist  # Return cached data even if compute fails
+
+            # Use nearest expiry for max gamma sensitivity
+            chain = t.option_chain(all_expiries[0])
+
+            # Find max call OI (resistance, positive gamma) and max put OI (support, negative gamma)
+            calls = chain.calls
+            puts = chain.puts
+
+            # Weighted average strike by open interest
+            call_oi = calls.get("openInterest", pd.Series(0, index=calls.index)).fillna(0)
+            put_oi = puts.get("openInterest", pd.Series(0, index=puts.index)).fillna(0)
+
+            call_oi_weighted = (calls["strike"] * call_oi).sum() / max(1, call_oi.sum())
+            put_oi_weighted = (puts["strike"] * put_oi).sum() / max(1, put_oi.sum())
+
+            # Flip zone roughly between weighted put and call strikes
+            flip_zone = (put_oi_weighted + call_oi_weighted) / 2
+
+            # Distance as % of spot
+            distance_pct = (spot - flip_zone) / spot * 100
+            today_val = distance_pct
+
+    except Exception as e:
+        log.info("Gamma flip zone calculation failed: %s", str(e)[:80])
+
+    # Merge with cache
+    if today_val is not None:
+        today = pd.Timestamp.today().normalize()
+        hist.loc[today] = today_val
+        hist = hist[~hist.index.duplicated(keep="last")].sort_index()
+        _save_cache("gamma_flip_history.csv", hist, "gamma_flip")
+
+    hist.name = "gamma_flip"
+    return hist
+
+
+def index_put_call_ratio() -> pd.Series:
+    """
+    Put/Call ratio specifically for INDEX options (SPX, NDX, RUT) vs equity options.
+
+    Retail hedges single stocks (equity puts). Institutions hedge portfolios (index puts).
+    High index P/C = institutional panic. Extreme readings followed by sharp drops
+    indicate institutions monetizing hedges and buying underlying.
+
+    Uses SPY/SPX options as institutional proxy. Cached to build history.
+    """
+    import yfinance as yf
+
+    # Load existing cache
+    hist = _load_cache("index_put_call_history.csv", "index_put_call")
+
+    # Compute today's value
+    today_val = None
+
+    # Try SPX first (pure institutional), fall back to SPY
+    for ticker in ("^SPX", "SPY"):
+        try:
+            with _silence_stderr():
+                t = yf.Ticker(ticker)
+                expiries = list(t.options)[:3]
+
+                tot_c = tot_p = 0.0
+                for e in expiries:
+                    try:
+                        oc = t.option_chain(e)
+                        tot_c += float(oc.calls["volume"].fillna(0).sum())
+                        tot_p += float(oc.puts["volume"].fillna(0).sum())
+                    except Exception:
+                        continue
+
+                if tot_c > 0:
+                    today_val = tot_p / tot_c
+                    break
+        except Exception:
+            continue
+
+    # Merge with cache
+    if today_val is not None:
+        today = pd.Timestamp.today().normalize()
+        hist.loc[today] = today_val
+        hist = hist[~hist.index.duplicated(keep="last")].sort_index()
+        _save_cache("index_put_call_history.csv", hist, "index_put_call")
+
+    hist.name = "index_put_call"
+    return hist
 
 
 # ---------------------------------------------------------------------------

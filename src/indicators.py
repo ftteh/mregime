@@ -147,6 +147,15 @@ def build_raw() -> RawFrame:
     s["real_yield_10y"] = D.real_yield_10y()
     s["copper_gold"] = D.copper_gold_ratio()
 
+    # ---- Interbank Funding / Repo Market Stress
+    s["fra_ois_spread"] = D.fra_ois_spread()
+    s["sofr_spread"] = D.sofr_spread()
+
+    # ---- Gamma Exposure / Options Market Structure
+    s["gamma_exposure"] = D.gamma_exposure_proxy()
+    s["gamma_flip_zone"] = D.gamma_flip_zone_distance()
+    s["index_put_call"] = D.index_put_call_ratio()
+
     # Metadata (current value + freshness)
     for k, v in s.items():
         if v is None or v.empty:

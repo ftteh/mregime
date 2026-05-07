@@ -291,12 +291,17 @@ def _line(
         return
     line_color = _top_risk_to_line_color(score if not np.isnan(score) else None)
     fig = go.Figure()
+    # If the series has only 1-2 points (common for cached daily snapshots like GEX),
+    # `mode="lines"` renders nearly invisible. Add markers so "fresh" indicators
+    # show up immediately.
+    mode = "lines" if len(plot_s) >= 3 else "lines+markers"
     fig.add_trace(
         go.Scatter(
             x=plot_s.index,
             y=plot_s.values,
-            mode="lines",
+            mode=mode,
             line=dict(width=2.8, color=line_color),
+            marker=dict(size=7, color=line_color, line=dict(color="rgba(0,0,0,0)", width=0)),
             fill="tozeroy",
             fillcolor=_rgb_to_rgba(line_color, 0.18),
             name=title,
@@ -725,6 +730,12 @@ INDICATOR_UNITS: dict[str, str] = {
     "dxy": "",
     "real_yield_10y": "%",
     "copper_gold": "x",
+    # New institutional indicators
+    "fra_ois_spread": "bps",
+    "sofr_spread": "bps",
+    "gamma_exposure": "$B",
+    "gamma_flip_zone": "%",
+    "index_put_call": "",
 }
 
 
@@ -737,10 +748,13 @@ def _fmt_raw_cell(row: pd.Series) -> str:
     # Per-indicator precision
     if key in ("ad_line_slope", "new_highs_lows", "fear_greed", "dxy", "net_liquidity"):
         val = f"{v:,.0f}"
-    elif key in ("copper_gold", "vix_term_9d_1m", "vix_term_1m_3m", "put_call"):
+    elif key in ("copper_gold", "vix_term_9d_1m", "vix_term_1m_3m", "put_call", "index_put_call"):
         val = f"{v:.3f}"
-    elif key in ("hy_spread_velocity", "aaii_bull_bear", "cta_positioning", "equity_risk_premium"):
+    elif key in ("hy_spread_velocity", "aaii_bull_bear", "cta_positioning", "equity_risk_premium",
+                 "fra_ois_spread", "sofr_spread", "gamma_flip_zone"):
         val = f"{v:+,.1f}"
+    elif key == "gamma_exposure":
+        val = f"{v:+.2f}"
     else:
         val = f"{v:,.2f}"
     return f"{val} {unit}".strip() if unit else val
@@ -1075,6 +1089,14 @@ with rc2:
         indicator_key="cta_positioning",
         marker_ts=ts_marker,
     )
+    # Dark pool / off-exchange accumulation (DIX)
+    _line(
+        raw.series.get("dix"),
+        "Dark Pool Index (DIX) — off-exchange buy pressure",
+        ref_lines=[(35, "low"), (45, "neutral"), (55, "high")],
+        extra_direction="risk_high_is_top",
+        marker_ts=ts_marker,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1132,6 +1154,90 @@ with yc2:
 
 
 # ---------------------------------------------------------------------------
+# REPO MARKET & INTERBANK FUNDING STRESS
+# ---------------------------------------------------------------------------
+st.markdown("### Repo market & interbank funding stress")
+st.caption(
+    "**Funding stress spread** = CP/SOFR vs T-Bill (post-LIBOR replacement for FRA-OIS). "
+    "**SOFR spread** = repo market collateral scarcity (Sept 2019 repo crisis). "
+    "Elevated = institutional panic = bottom setup."
+)
+rm1, rm2 = st.columns(2)
+with rm1:
+    _line(
+        raw.series.get("fra_ois_spread"),
+        "Funding Stress Spread (bps) — CP/SOFR vs T-Bill",
+        ref_lines=[(20, "normal"), (50, "elevated"), (100, "crisis")],
+        indicator_key="fra_ois_spread",
+        marker_ts=ts_marker,
+    )
+with rm2:
+    _line(
+        raw.series.get("sofr_spread"),
+        "SOFR Spread vs Fed Funds (bps)",
+        ref_lines=[(0, "normal"), (25, "elevated"), (50, "repo stress")],
+        extra_direction="contrarian_high_is_top",
+        marker_ts=ts_marker,
+    )
+
+
+# ---------------------------------------------------------------------------
+# OPTIONS MARKET STRUCTURE — Gamma Exposure (GEX)
+# ---------------------------------------------------------------------------
+st.markdown("### Options market structure — Gamma Exposure (GEX)")
+st.caption(
+    "**GEX** = dealer gamma exposure. Deep negative = forced selling into weakness (crash accelerant). "
+    "**Gamma Flip Zone** = distance to zero-gamma price. Negative = below flip = unstable regime. "
+    "Extreme negative readings = structural selling exhausted = bottom."
+)
+gx1, gx2 = st.columns(2)
+with gx1:
+    _line(
+        raw.series.get("gamma_exposure"),
+        "Gamma Exposure Proxy ($B notional)",
+        ref_lines=[(0, "zero gamma"), (-5, "negative = forced selling")],
+        extra_direction="risk_high_is_top",
+        marker_ts=ts_marker,
+    )
+with gx2:
+    _line(
+        raw.series.get("gamma_flip_zone"),
+        "Gamma Flip Zone Distance (%)",
+        ref_lines=[(0, "at flip zone"), (-2, "below flip = negative gamma")],
+        extra_direction="contrarian_high_is_top",
+        marker_ts=ts_marker,
+    )
+
+
+# ---------------------------------------------------------------------------
+# INSTITUTIONAL POSITIONING — Index Put/Call vs Equity Put/Call
+# ---------------------------------------------------------------------------
+st.markdown("### Institutional positioning — Index vs Equity hedging")
+st.caption(
+    "**Index Put/Call** = institutional portfolio hedging (SPX/SPY). Spike = smart money panic. "
+    "**Equity Put/Call** = retail single-stock hedging. "
+    "Index P/C extremes followed by rapid drops = hedges monetized = bottom."
+)
+pc1, pc2 = st.columns(2)
+with pc1:
+    _line(
+        raw.series.get("index_put_call"),
+        "Index Put/Call Ratio (Institutional)",
+        ref_lines=[(0.8, "normal"), (1.2, "elevated hedging"), (1.5, "panic")],
+        extra_direction="contrarian_high_is_top",
+        marker_ts=ts_marker,
+    )
+with pc2:
+    _line(
+        raw.series.get("put_call"),
+        "Equity Put/Call Ratio (Retail/Equity)",
+        ref_lines=[(0.5, "complacency"), (0.8, "normal"), (1.2, "fear")],
+        indicator_key="put_call",
+        marker_ts=ts_marker,
+    )
+
+
+# ---------------------------------------------------------------------------
 # CREDIT VELOCITY & MACRO CONTEXT
 # ---------------------------------------------------------------------------
 st.markdown("### Credit velocity & macro context")
@@ -1178,6 +1284,7 @@ st.markdown("### Pro Watchlist — divergences & confluence")
 mv = raw.series.get("move_vix_div", pd.Series(dtype=float))
 cc = raw.series.get("corr_cluster", pd.Series(dtype=float))
 
+# First row: Bond vol, correlation, dark pool
 dc1, dc2, dc3 = st.columns(3)
 with dc1:
     if not mv.empty:
@@ -1212,6 +1319,76 @@ with dc3:
             st.info(f"DIX {last:.1f} ≈ 60D avg {avg:.1f} — neutral dark-pool flow.")
     else:
         st.caption("DIX: source unavailable (squeezemetrics). Optional indicator.")
+
+# Second row: Repo stress, Gamma, Institutional P/C
+dc4, dc5, dc6 = st.columns(3)
+with dc4:
+    sofr = raw.series.get("sofr_spread", pd.Series(dtype=float))
+    fra = raw.series.get("fra_ois_spread", pd.Series(dtype=float))
+    if not sofr.empty:
+        last = sofr.iloc[-1]
+        if last > 50:
+            st.error(f"SOFR spread = {last:.1f} bps — severe repo stress (crisis level).")
+        elif last > 25:
+            st.warning(f"SOFR spread = {last:.1f} bps — elevated repo funding stress.")
+        elif last > 10:
+            st.info(f"SOFR spread = {last:.1f} bps — somewhat elevated.")
+        else:
+            st.success(f"SOFR spread = {last:.1f} bps — normal repo conditions.")
+    elif not fra.empty:
+        last = fra.iloc[-1]
+        if last > 100:
+            st.error(f"FRA-OIS = {last:.0f} bps — crisis-level interbank stress.")
+        elif last > 50:
+            st.warning(f"FRA-OIS = {last:.0f} bps — elevated bank funding stress.")
+        else:
+            st.info(f"FRA-OIS = {last:.0f} bps — interbank funding normal.")
+    else:
+        st.caption("Repo metrics: awaiting FRED data (SOFR/FRA-OIS).")
+
+with dc5:
+    gex = raw.series.get("gamma_exposure", pd.Series(dtype=float))
+    flip = raw.series.get("gamma_flip_zone", pd.Series(dtype=float))
+    if not gex.empty:
+        last_gex = gex.iloc[-1]
+        if not flip.empty:
+            last_flip = flip.iloc[-1]
+            if last_gex < -2 and last_flip < 0:
+                st.warning(f"GEX = {last_gex:+.1f}$B, Flip = {last_flip:+.1f}% — negative gamma regime (unstable).")
+            elif last_gex < -5:
+                st.error(f"GEX = {last_gex:+.1f}$B — deep negative (forced selling dominant).")
+            elif last_gex > 0:
+                st.success(f"GEX = {last_gex:+.1f}$B — positive gamma (stabilizing environment).")
+            else:
+                st.info(f"GEX = {last_gex:+.1f}$B — near neutral gamma.")
+        else:
+            st.info(f"GEX = {last_gex:+.1f}$B — building history.")
+    else:
+        st.caption("GEX: building history from options chain (SPY).")
+
+with dc6:
+    idx_pc = raw.series.get("index_put_call", pd.Series(dtype=float))
+    eq_pc = raw.series.get("put_call", pd.Series(dtype=float))
+    if not idx_pc.empty:
+        last = idx_pc.iloc[-1]
+        if not eq_pc.empty:
+            eq_last = eq_pc.iloc[-1]
+            spread = last - eq_last
+            if last > 1.5:
+                st.error(f"Index P/C = {last:.2f} — institutional panic (extreme hedge demand).")
+            elif last > 1.2:
+                st.warning(f"Index P/C = {last:.2f} — elevated institutional hedging.")
+            elif spread > 0.3:
+                st.info(f"Index P/C ({last:.2f}) > Equity P/C ({eq_last:.2f}) — smart money more hedged than retail.")
+            else:
+                st.success(f"Index P/C = {last:.2f} — normal institutional positioning.")
+        else:
+            if last > 1.5:
+                st.warning(f"Index P/C = {last:.2f} — elevated.")
+            else:
+                st.info(f"Index P/C = {last:.2f}")
+    else:
+        st.caption("Index P/C: building history from SPX/SPY options.")
 
 
 # ---------------------------------------------------------------------------
