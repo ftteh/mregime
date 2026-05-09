@@ -10,6 +10,7 @@ import io
 import json
 import logging
 import os
+import re
 import sys
 from datetime import datetime, timedelta
 from functools import lru_cache
@@ -683,93 +684,242 @@ def fear_greed_index() -> pd.Series:
         return pd.Series(dtype=float, name="fear_greed")
 
 
-def put_call_ratio() -> pd.Series:
-    """
-    Put/Call ratio — computed LIVE from SPY's options chain via yfinance.
-
-    CBOE's free CSV archive is frozen at 2019, so we sum today's put volume
-    vs call volume across SPY's front-month expiries (the most liquid contracts).
-    Each daily reading is appended to a local CSV cache so history accumulates.
-
-    This is technically SPY-only put/call (vs CBOE's exchange-wide), but the
-    correlation with the CBOE Total P/C is ~0.85 and this gives us LIVE data.
-    """
-    import os
-
-    # ---- Pull today's snapshot from SPY options chain
-    today_val = None
-    try:
-        import yfinance as yf
-        with _silence_stderr():
-            t = yf.Ticker("SPY")
-            expiries = list(t.options)[:3]  # 3 nearest expiries = deepest liquidity
-            tot_c = tot_p = 0.0
-            for e in expiries:
-                try:
-                    oc = t.option_chain(e)
-                    tot_c += float(oc.calls["volume"].fillna(0).sum())
-                    tot_p += float(oc.puts["volume"].fillna(0).sum())
-                except Exception:
-                    continue
-        if tot_c > 0:
-            today_val = round(tot_p / tot_c, 4)
-    except Exception as e:
-        log.info("SPY put/call snapshot unavailable (%s)", str(e)[:80])
-
-    # ---- Load existing cache (disk-based, builds history over time)
+def _series_cache_path(filename: str) -> str:
     cache_dir = os.path.join(os.path.dirname(__file__), "..", "cache")
     os.makedirs(cache_dir, exist_ok=True)
-    cache_path = os.path.join(cache_dir, "put_call_history.csv")
+    return os.path.join(cache_dir, filename)
 
-    if os.path.exists(cache_path):
-        try:
-            hist = pd.read_csv(cache_path, parse_dates=["date"]).set_index("date")["put_call"]
-        except Exception:
-            hist = pd.Series(dtype=float, name="put_call")
-    else:
-        hist = pd.Series(dtype=float, name="put_call")
 
-    # ---- Append today if we have a fresh reading
-    if today_val is not None:
-        today = pd.Timestamp.today().normalize()
-        hist.loc[today] = today_val
-        hist = hist[~hist.index.duplicated(keep="last")].sort_index()
-        try:
-            hist.to_frame("put_call").reset_index().rename(columns={"index": "date"})\
-                .to_csv(cache_path, index=False)
-        except Exception as e:
-            log.warning("Put/Call cache write failed: %s", e)
+def _load_series_cache(filename: str, col_name: str) -> pd.Series:
+    path = _series_cache_path(filename)
+    if not os.path.exists(path):
+        return pd.Series(dtype=float, name=col_name)
+    try:
+        df = pd.read_csv(path, parse_dates=["date"])
+        s = pd.to_numeric(df.set_index("date")[col_name], errors="coerce").dropna()
+        s.name = col_name
+        return s.sort_index()
+    except Exception:
+        return pd.Series(dtype=float, name=col_name)
 
-    # ---- Optionally seed with the old CBOE archive for historical context
-    #      (only up to 2019-2020 but gives a long baseline for the percentile rank)
-    if hist.empty or len(hist) < 30:
-        for url in (
-            "https://cdn.cboe.com/resources/options/volume_and_call_put_ratios/totalpcarchive.csv",
-        ):
-            try:
-                r = requests.get(url, headers=UA, timeout=10)
-                if not r.ok:
-                    continue
-                lines = r.text.splitlines()
-                header = next((i for i, ln in enumerate(lines)
-                               if "DATE" in ln.upper() and "P/C" in ln.upper().replace(" ", "")), 0)
-                df = pd.read_csv(io.StringIO(r.text), skiprows=header)
-                df.columns = [c.strip().upper() for c in df.columns]
-                dcol = next((c for c in df.columns if "DATE" in c), None)
-                pcc = next((c for c in df.columns if "P/C" in c or "RATIO" in c), None)
-                if dcol and pcc:
-                    df[dcol] = pd.to_datetime(df[dcol], errors="coerce")
-                    seed = pd.to_numeric(
-                        df.dropna(subset=[dcol]).set_index(dcol)[pcc], errors="coerce"
-                    ).dropna().sort_index()
-                    seed.name = "put_call"
-                    hist = pd.concat([seed, hist])
-                    hist = hist[~hist.index.duplicated(keep="last")].sort_index()
-            except Exception as e:
-                log.warning("CBOE seed fetch failed: %s", e)
 
-    hist.name = "put_call"
-    return hist
+def _save_series_cache(filename: str, series: pd.Series, col_name: str) -> None:
+    path = _series_cache_path(filename)
+    try:
+        out = pd.to_numeric(series, errors="coerce").dropna()
+        out = out[~out.index.duplicated(keep="last")].sort_index()
+        out.to_frame(col_name).reset_index().rename(columns={"index": "date"}).to_csv(path, index=False)
+    except Exception as e:
+        log.warning("Cache write failed for %s: %s", filename, e)
+
+
+def _merge_series(name: str, *series: pd.Series) -> pd.Series:
+    parts = []
+    for s in series:
+        if s is None or s.empty:
+            continue
+        out = pd.to_numeric(s.copy(), errors="coerce").dropna()
+        if out.empty:
+            continue
+        if not isinstance(out.index, pd.DatetimeIndex):
+            out.index = pd.to_datetime(out.index, errors="coerce")
+            out = out[out.index.notna()]
+        if out.empty:
+            continue
+        if getattr(out.index, "tz", None) is not None:
+            out.index = out.index.tz_localize(None)
+        parts.append(out.sort_index())
+    if not parts:
+        return pd.Series(dtype=float, name=name)
+    merged = pd.concat(parts)
+    merged = pd.to_numeric(merged, errors="coerce").dropna()
+    merged = merged[~merged.index.duplicated(keep="last")].sort_index()
+    merged.name = name
+    return merged
+
+
+def _read_cboe_put_call_csv(url: str, name: str) -> pd.Series:
+    try:
+        r = requests.get(url, headers=UA, timeout=12)
+        if not r.ok or "," not in r.text[:1000]:
+            return pd.Series(dtype=float, name=name)
+        lines = r.text.splitlines()
+        header = next(
+            (
+                i for i, line in enumerate(lines)
+                if ("DATE" in line.upper() or "TRADE_DATE" in line.upper())
+                and ("P/C" in line.upper().replace(" ", "") or "RATIO" in line.upper())
+            ),
+            0,
+        )
+        df = pd.read_csv(io.StringIO(r.text), skiprows=header)
+        df.columns = [str(c).strip() for c in df.columns]
+        date_col = next((c for c in df.columns if "date" in c.lower()), None)
+        ratio_col = next(
+            (
+                c for c in df.columns
+                if "p/c" in c.lower().replace(" ", "") or "ratio" in c.lower()
+            ),
+            None,
+        )
+        if date_col is None or ratio_col is None:
+            return pd.Series(dtype=float, name=name)
+        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+        s = pd.to_numeric(
+            df.dropna(subset=[date_col]).set_index(date_col)[ratio_col],
+            errors="coerce",
+        ).dropna()
+        s.name = name
+        return s.sort_index()
+    except Exception as e:
+        log.info("CBOE put/call CSV failed for %s (%s)", url, str(e)[:80])
+        return pd.Series(dtype=float, name=name)
+
+
+@lru_cache(maxsize=8)
+def _cboe_put_call_history(kind: str, name: str) -> pd.Series:
+    """CBOE's no-key CSVs cover the official series through Oct 2019."""
+    urls = [
+        f"https://cdn.cboe.com/resources/options/volume_and_call_put_ratios/{kind}pcarchive.csv",
+        f"https://cdn.cboe.com/resources/options/volume_and_call_put_ratios/{kind}pc.csv",
+    ]
+    return _merge_series(name, *(_read_cboe_put_call_csv(url, name) for url in urls))
+
+
+@lru_cache(maxsize=8)
+def _ycharts_recent_indicator(slug: str, name: str) -> pd.Series:
+    """
+    YCharts exposes the most recent public rows for CBOE daily statistics without
+    auth. It is not a full archive, but it fills the current chart window with
+    official CBOE values instead of a single local snapshot.
+    """
+    url = f"https://ycharts.com/indicators/{slug}"
+    try:
+        r = requests.get(url, headers=UA, timeout=12)
+        if not r.ok:
+            return pd.Series(dtype=float, name=name)
+        tables = pd.read_html(io.StringIO(r.text))
+        parts = []
+        for df in tables:
+            cols = [str(c).strip() for c in df.columns]
+            if "Date" not in cols or "Value" not in cols:
+                continue
+            date_col = cols[cols.index("Date")]
+            value_col = cols[cols.index("Value")]
+            tmp = df[[date_col, value_col]].copy()
+            tmp[date_col] = pd.to_datetime(tmp[date_col], errors="coerce")
+            tmp[value_col] = pd.to_numeric(tmp[value_col], errors="coerce")
+            s = tmp.dropna(subset=[date_col, value_col]).set_index(date_col)[value_col]
+            if not s.empty:
+                parts.append(s)
+        return _merge_series(name, *parts)
+    except Exception as e:
+        log.info("YCharts recent %s unavailable (%s)", slug, str(e)[:80])
+        return pd.Series(dtype=float, name=name)
+
+
+@lru_cache(maxsize=8)
+def _cboe_delayed_options(symbol: str) -> tuple[pd.DataFrame, float]:
+    """Delayed CBOE option chain JSON with greeks, OI and volume. No API key."""
+    url = f"https://cdn.cboe.com/api/global/delayed_quotes/options/{symbol.upper()}.json"
+    try:
+        r = requests.get(url, headers=UA, timeout=15)
+        if not r.ok:
+            return pd.DataFrame(), np.nan
+        payload = r.json()
+        data = payload.get("data", {})
+        options = data.get("options", [])
+        if not options:
+            return pd.DataFrame(), np.nan
+        df = pd.DataFrame(options)
+        parsed = df["option"].astype(str).str.extract(
+            rf"^{re.escape(symbol.upper())}(?P<expiry>\d{{6}})(?P<type>[CP])(?P<strike>\d{{8}})$"
+        )
+        df = pd.concat([df, parsed], axis=1).dropna(subset=["expiry", "type", "strike"])
+        if df.empty:
+            return pd.DataFrame(), np.nan
+        df["expiry"] = pd.to_datetime("20" + df["expiry"], format="%Y%m%d", errors="coerce")
+        df["strike"] = pd.to_numeric(df["strike"], errors="coerce") / 1000.0
+        for col in ("volume", "open_interest", "gamma", "last_trade_price", "bid", "ask"):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        spot = pd.to_numeric(pd.Series([data.get("current_price")]), errors="coerce").iloc[0]
+        return df.dropna(subset=["expiry", "strike"]), float(spot)
+    except Exception as e:
+        log.info("CBOE delayed options %s unavailable (%s)", symbol, str(e)[:80])
+        return pd.DataFrame(), np.nan
+
+
+def _near_expiry_options(df: pd.DataFrame, max_expiries: int = 3) -> pd.DataFrame:
+    if df.empty or "expiry" not in df.columns:
+        return df
+    expiries = pd.Series(df["expiry"].dropna().unique()).sort_values().tolist()
+    if not expiries:
+        return df.iloc[0:0]
+    return df[df["expiry"].isin(expiries[:max_expiries])].copy()
+
+
+def _cboe_live_put_call_ratio(symbols: tuple[str, ...], max_expiries: int = 3) -> float | None:
+    total_calls = 0.0
+    total_puts = 0.0
+    for symbol in symbols:
+        df, _ = _cboe_delayed_options(symbol)
+        sub = _near_expiry_options(df, max_expiries=max_expiries)
+        if sub.empty or "volume" not in sub.columns:
+            continue
+        vol = sub["volume"].fillna(0.0)
+        total_calls += float(vol[sub["type"] == "C"].sum())
+        total_puts += float(vol[sub["type"] == "P"].sum())
+    if total_calls <= 0:
+        return None
+    return round(total_puts / total_calls, 4)
+
+
+def _official_put_call_series(
+    *,
+    kind: str,
+    ycharts_slug: str,
+    name: str,
+    cache_filename: str,
+    live_symbols: tuple[str, ...],
+) -> pd.Series:
+    hist = _cboe_put_call_history(kind, name)
+    recent = _ycharts_recent_indicator(ycharts_slug, name)
+    cache = _load_series_cache(cache_filename, name)
+    if not cache.empty:
+        cache = cache[cache.index.dayofweek < 5]
+
+    live = pd.Series(dtype=float, name=name)
+    today = pd.Timestamp.today().normalize()
+    last_market_day = today if today.dayofweek < 5 else today - pd.offsets.BDay(1)
+    recent_last = recent.index.max().normalize() if not recent.empty else pd.Timestamp.min
+    if recent_last < last_market_day:
+        live_val = _cboe_live_put_call_ratio(live_symbols)
+        if live_val is not None:
+            live = pd.Series([live_val], index=[last_market_day], name=name)
+
+    merged = _merge_series(name, hist, cache, recent, live)
+    if not live.empty:
+        _save_series_cache(cache_filename, merged, name)
+    return merged
+
+
+def put_call_ratio() -> pd.Series:
+    """
+    CBOE Equity Put/Call ratio.
+
+    Source priority:
+    1. CBOE official CSV archive/recent files through Oct 2019
+    2. YCharts public recent CBOE daily-stat rows
+    3. CBOE delayed option-chain live ETF proxy + local cache
+    """
+    return _official_put_call_series(
+        kind="equity",
+        ycharts_slug="cboe_equity_put_call_ratio",
+        name="put_call",
+        cache_filename="put_call_history.csv",
+        live_symbols=("SPY", "QQQ", "IWM"),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -868,6 +1018,19 @@ def dix_proxy() -> pd.Series:
     return pd.Series(dtype=float, name="dix")
 
 
+def _normalize_gex_units(s: pd.Series) -> pd.Series:
+    """Normalize GEX to $B; some public feeds/cache rows arrive as raw dollars."""
+    out = pd.to_numeric(s.copy(), errors="coerce").dropna()
+    if out.empty:
+        out.name = "gamma_exposure"
+        return out
+    dollar_mask = out.abs() > 1_000_000
+    if dollar_mask.any():
+        out.loc[dollar_mask] = out.loc[dollar_mask] / 1e9
+    out.name = "gamma_exposure"
+    return out
+
+
 def squeezemetrics_gex() -> pd.Series:
     """
     GEX (Gamma Exposure) from SqueezeMetrics — historical daily series.
@@ -877,9 +1040,7 @@ def squeezemetrics_gex() -> pd.Series:
     """
     df = _squeezemetrics_csv()
     if not df.empty and "gex" in df.columns:
-        s = df["gex"].astype(float).dropna()
-        s.name = "gamma_exposure"
-        return s
+        return _normalize_gex_units(df["gex"])
     return pd.Series(dtype=float, name="gamma_exposure")
 
 
@@ -1100,30 +1261,73 @@ def sofr_spread() -> pd.Series:
 # ---------------------------------------------------------------------------
 def _cache_path(filename: str) -> str:
     """Return full path for a cache file."""
-    cache_dir = os.path.join(os.path.dirname(__file__), "..", "cache")
-    os.makedirs(cache_dir, exist_ok=True)
-    return os.path.join(cache_dir, filename)
+    return _series_cache_path(filename)
 
 
 def _load_cache(filename: str, col_name: str) -> pd.Series:
     """Load a cached time series from CSV."""
-    path = _cache_path(filename)
-    if os.path.exists(path):
-        try:
-            df = pd.read_csv(path, parse_dates=["date"])
-            return df.set_index("date")[col_name]
-        except Exception:
-            return pd.Series(dtype=float, name=col_name)
-    return pd.Series(dtype=float, name=col_name)
+    return _load_series_cache(filename, col_name)
 
 
 def _save_cache(filename: str, series: pd.Series, col_name: str):
     """Save a time series to CSV cache."""
-    path = _cache_path(filename)
-    try:
-        series.to_frame(col_name).reset_index().rename(columns={"index": "date"}).to_csv(path, index=False)
-    except Exception as e:
-        log.warning("Cache write failed for %s: %s", filename, e)
+    _save_series_cache(filename, series, col_name)
+
+
+def _cboe_gamma_snapshot(symbol: str = "SPY") -> tuple[float | None, float | None]:
+    """
+    Current GEX and gamma-flip distance from CBOE's delayed option-chain JSON.
+
+    GEX is expressed as $B per 1% underlying move. The flip distance is still an
+    estimate: without recomputing greeks across hypothetical spot prices, the
+    most stable no-key proxy is the midpoint between gamma/OI-weighted put and
+    call strikes across the front expiries.
+    """
+    df, spot = _cboe_delayed_options(symbol)
+    sub = _near_expiry_options(df, max_expiries=4)
+    if sub.empty or not np.isfinite(spot) or spot <= 0:
+        return None, None
+
+    oi = sub.get("open_interest", pd.Series(0.0, index=sub.index)).fillna(0.0)
+    gamma = sub.get("gamma", pd.Series(0.0, index=sub.index)).fillna(0.0)
+    strikes = sub["strike"].fillna(0.0)
+    sign = np.where(sub["type"].eq("C"), 1.0, -1.0)
+    gamma_dollars = pd.Series(sign * gamma * oi * 100.0 * (spot ** 2) * 0.01, index=sub.index)
+    gex = float(gamma_dollars.sum() / 1e9)
+
+    call_w = (gamma.abs() * oi).where(sub["type"].eq("C"), 0.0)
+    put_w = (gamma.abs() * oi).where(sub["type"].eq("P"), 0.0)
+    flip_distance = None
+    if call_w.sum() > 0 and put_w.sum() > 0:
+        call_strike = float((strikes * call_w).sum() / call_w.sum())
+        put_strike = float((strikes * put_w).sum() / put_w.sum())
+        flip_zone = (call_strike + put_strike) / 2.0
+        if flip_zone > 0:
+            flip_distance = float((spot - flip_zone) / spot * 100.0)
+
+    return gex, flip_distance
+
+
+def _gex_implied_gamma_flip_history(gex: pd.Series) -> pd.Series:
+    """
+    Backfill a display/history proxy for gamma-flip distance from historical GEX.
+
+    True historical zero-gamma requires point-in-time option chains, which are
+    not publicly available without a paid feed. When we have historical GEX but
+    only a live flip snapshot, this keeps the chart useful by preserving the
+    sign and intensity of the gamma regime instead of showing an empty panel.
+    """
+    if gex is None or gex.empty or len(gex.dropna()) < 30:
+        return pd.Series(dtype=float, name="gamma_flip")
+    s = pd.to_numeric(gex.copy(), errors="coerce").dropna()
+    scale = s.abs().rolling(252, min_periods=30).quantile(0.85)
+    fallback_scale = float(s.abs().quantile(0.85)) if not s.empty else np.nan
+    if not np.isfinite(fallback_scale) or fallback_scale <= 0:
+        return pd.Series(dtype=float, name="gamma_flip")
+    scale = scale.replace(0, np.nan).ffill().fillna(fallback_scale)
+    proxy = (s / scale).clip(-2.5, 2.5) * 1.25
+    proxy.name = "gamma_flip"
+    return proxy.dropna()
 
 
 def gamma_exposure_proxy() -> pd.Series:
@@ -1140,66 +1344,66 @@ def gamma_exposure_proxy() -> pd.Series:
     """
     import yfinance as yf
 
-    # Try SqueezeMetrics first (has years of history)
+    hist = _normalize_gex_units(_load_cache("gamma_exposure_history.csv", "gamma_exposure"))
+
+    # SqueezeMetrics, when available, gives the historical backbone.
     sqz = squeezemetrics_gex()
-    if not sqz.empty and len(sqz) > 30:
-        return sqz
+    if not sqz.empty:
+        hist = _merge_series("gamma_exposure", sqz, hist)
 
-    # Fall back to live computation + disk cache
-    hist = _load_cache("gamma_exposure_history.csv", "gamma_exposure")
-
-    today_val = None
+    today_val, _ = _cboe_gamma_snapshot("SPY")
     try:
-        with _silence_stderr():
-            t = yf.Ticker("SPY")
-            spot = t.info.get("regularMarketPrice", t.info.get("previousClose", 0))
-            if not spot:
-                spot_hist = t.history(period="5d")["Close"].iloc[-1]
-                spot = float(spot_hist)
+        if today_val is None:
+            with _silence_stderr():
+                t = yf.Ticker("SPY")
+                spot = t.info.get("regularMarketPrice", t.info.get("previousClose", 0))
+                if not spot:
+                    spot_hist = t.history(period="5d")["Close"].iloc[-1]
+                    spot = float(spot_hist)
 
-            all_expiries = list(t.options)
-            near_expiries = [e for e in all_expiries[:4] if e]
+                all_expiries = list(t.options)
+                near_expiries = [e for e in all_expiries[:4] if e]
 
-            total_gamma = 0.0
-            total_dollars = 0.0
+                total_gamma = 0.0
+                total_dollars = 0.0
 
-            for expiry in near_expiries:
-                try:
-                    chain = t.option_chain(expiry)
-                    calls = chain.calls
-                    puts = chain.puts
+                for expiry in near_expiries:
+                    try:
+                        chain = t.option_chain(expiry)
+                        calls = chain.calls
+                        puts = chain.puts
 
-                    for _, row in calls.iterrows():
-                        strike = row["strike"]
-                        oi = row.get("openInterest", 0) or 0
-                        if oi > 0:
-                            moneyness = abs(strike - spot) / spot
-                            gamma_weight = oi * max(0.1, 1 - moneyness * 5)
-                            total_gamma += gamma_weight * 0.01
-                            total_dollars += oi * row.get("lastPrice", 0) * 100
+                        for _, row in calls.iterrows():
+                            strike = row["strike"]
+                            oi = row.get("openInterest", 0) or 0
+                            if oi > 0:
+                                moneyness = abs(strike - spot) / spot
+                                gamma_weight = oi * max(0.1, 1 - moneyness * 5)
+                                total_gamma += gamma_weight * 0.01
+                                total_dollars += oi * row.get("lastPrice", 0) * 100
 
-                    for _, row in puts.iterrows():
-                        strike = row["strike"]
-                        oi = row.get("openInterest", 0) or 0
-                        if oi > 0:
-                            moneyness = abs(strike - spot) / spot
-                            gamma_weight = oi * max(0.1, 1 - moneyness * 5)
-                            if strike < spot:
-                                total_gamma -= gamma_weight * 0.02
-                            total_dollars += oi * row.get("lastPrice", 0) * 100
+                        for _, row in puts.iterrows():
+                            strike = row["strike"]
+                            oi = row.get("openInterest", 0) or 0
+                            if oi > 0:
+                                moneyness = abs(strike - spot) / spot
+                                gamma_weight = oi * max(0.1, 1 - moneyness * 5)
+                                if strike < spot:
+                                    total_gamma -= gamma_weight * 0.02
+                                total_dollars += oi * row.get("lastPrice", 0) * 100
 
-                except Exception:
-                    continue
+                    except Exception:
+                        continue
 
-            if total_dollars > 0:
-                today_val = total_gamma / 1e9
-
+                if total_dollars > 0:
+                    today_val = total_gamma / 1e9
     except Exception as e:
         log.info("Gamma exposure calculation failed: %s", str(e)[:80])
 
     if today_val is not None:
         today = pd.Timestamp.today().normalize()
         hist.loc[today] = today_val
+        hist = _normalize_gex_units(hist)
         hist = hist[~hist.index.duplicated(keep="last")].sort_index()
         _save_cache("gamma_exposure_history.csv", hist, "gamma_exposure")
 
@@ -1221,49 +1425,48 @@ def gamma_flip_zone_distance() -> pd.Series:
     """
     import yfinance as yf
 
-    # Load existing cache
     hist = _load_cache("gamma_flip_history.csv", "gamma_flip")
+    gex_history = gamma_exposure_proxy()
+    proxy_hist = _gex_implied_gamma_flip_history(gex_history)
+    hist = _merge_series("gamma_flip", proxy_hist, hist)
 
-    # Compute today's value
-    today_val = None
+    _, today_val = _cboe_gamma_snapshot("SPY")
     try:
-        with _silence_stderr():
-            t = yf.Ticker("SPY")
-            spot = t.info.get("regularMarketPrice", t.info.get("previousClose", 0))
-            if not spot:
-                px_hist = t.history(period="5d")["Close"].iloc[-1]
-                spot = float(px_hist)
+        if today_val is None:
+            with _silence_stderr():
+                t = yf.Ticker("SPY")
+                spot = t.info.get("regularMarketPrice", t.info.get("previousClose", 0))
+                if not spot:
+                    px_hist = t.history(period="5d")["Close"].iloc[-1]
+                    spot = float(px_hist)
 
-            # Estimate flip zone from option open interest distribution
-            all_expiries = list(t.options)
-            if not all_expiries:
-                return hist  # Return cached data even if compute fails
+                # Estimate flip zone from option open interest distribution
+                all_expiries = list(t.options)
+                if not all_expiries:
+                    return hist  # Return cached/proxy data even if compute fails
 
-            # Use nearest expiry for max gamma sensitivity
-            chain = t.option_chain(all_expiries[0])
+                # Use nearest expiry for max gamma sensitivity
+                chain = t.option_chain(all_expiries[0])
 
-            # Find max call OI (resistance, positive gamma) and max put OI (support, negative gamma)
-            calls = chain.calls
-            puts = chain.puts
+                calls = chain.calls
+                puts = chain.puts
 
-            # Weighted average strike by open interest
-            call_oi = calls.get("openInterest", pd.Series(0, index=calls.index)).fillna(0)
-            put_oi = puts.get("openInterest", pd.Series(0, index=puts.index)).fillna(0)
+                # Weighted average strike by open interest
+                call_oi = calls.get("openInterest", pd.Series(0, index=calls.index)).fillna(0)
+                put_oi = puts.get("openInterest", pd.Series(0, index=puts.index)).fillna(0)
 
-            call_oi_weighted = (calls["strike"] * call_oi).sum() / max(1, call_oi.sum())
-            put_oi_weighted = (puts["strike"] * put_oi).sum() / max(1, put_oi.sum())
+                call_oi_weighted = (calls["strike"] * call_oi).sum() / max(1, call_oi.sum())
+                put_oi_weighted = (puts["strike"] * put_oi).sum() / max(1, put_oi.sum())
 
-            # Flip zone roughly between weighted put and call strikes
-            flip_zone = (put_oi_weighted + call_oi_weighted) / 2
+                # Flip zone roughly between weighted put and call strikes
+                flip_zone = (put_oi_weighted + call_oi_weighted) / 2
 
-            # Distance as % of spot
-            distance_pct = (spot - flip_zone) / spot * 100
-            today_val = distance_pct
-
+                # Distance as % of spot
+                distance_pct = (spot - flip_zone) / spot * 100
+                today_val = distance_pct
     except Exception as e:
         log.info("Gamma flip zone calculation failed: %s", str(e)[:80])
 
-    # Merge with cache
     if today_val is not None:
         today = pd.Timestamp.today().normalize()
         hist.loc[today] = today_val
@@ -1282,47 +1485,17 @@ def index_put_call_ratio() -> pd.Series:
     High index P/C = institutional panic. Extreme readings followed by sharp drops
     indicate institutions monetizing hedges and buying underlying.
 
-    Uses SPY/SPX options as institutional proxy. Cached to build history.
+    Uses official CBOE index P/C history and recent public YCharts rows.
+    Falls back to a CBOE delayed ETF-chain proxy only when official recent
+    rows are unavailable.
     """
-    import yfinance as yf
-
-    # Load existing cache
-    hist = _load_cache("index_put_call_history.csv", "index_put_call")
-
-    # Compute today's value
-    today_val = None
-
-    # Try SPX first (pure institutional), fall back to SPY
-    for ticker in ("^SPX", "SPY"):
-        try:
-            with _silence_stderr():
-                t = yf.Ticker(ticker)
-                expiries = list(t.options)[:3]
-
-                tot_c = tot_p = 0.0
-                for e in expiries:
-                    try:
-                        oc = t.option_chain(e)
-                        tot_c += float(oc.calls["volume"].fillna(0).sum())
-                        tot_p += float(oc.puts["volume"].fillna(0).sum())
-                    except Exception:
-                        continue
-
-                if tot_c > 0:
-                    today_val = tot_p / tot_c
-                    break
-        except Exception:
-            continue
-
-    # Merge with cache
-    if today_val is not None:
-        today = pd.Timestamp.today().normalize()
-        hist.loc[today] = today_val
-        hist = hist[~hist.index.duplicated(keep="last")].sort_index()
-        _save_cache("index_put_call_history.csv", hist, "index_put_call")
-
-    hist.name = "index_put_call"
-    return hist
+    return _official_put_call_series(
+        kind="index",
+        ycharts_slug="cboe_index_put_call_ratio",
+        name="index_put_call",
+        cache_filename="index_put_call_history.csv",
+        live_symbols=("SPY", "QQQ", "IWM"),
+    )
 
 
 # ---------------------------------------------------------------------------

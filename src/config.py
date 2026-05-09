@@ -127,7 +127,7 @@ INDICATORS: list[IndicatorSpec] = [
     ),
     IndicatorSpec(
         key="put_call", label="CBOE Equity Put/Call Ratio",
-        bucket="sentiment_positioning", source="cboe CSV",
+        bucket="sentiment_positioning", source="CBOE/YCharts",
         direction="contrarian_high_is_top",
         description="Options hedging demand. Spikes = panic bottom, <0.5 = complacency top. INVERTED.",
     ),
@@ -250,13 +250,13 @@ INDICATORS: list[IndicatorSpec] = [
     # 11. Gamma Exposure (GEX) - Options Market Structure
     IndicatorSpec(
         key="gamma_exposure", label="Gamma Exposure (GEX) Proxy",
-        bucket="sentiment_positioning", source="computed: SPY options chain",
+        bucket="sentiment_positioning", source="CBOE delayed SPY options",
         direction="risk_high_is_top",
         description="Estimated dealer gamma exposure from SPY options. Deep negative GEX = market makers forced to sell into weakness (crash accelerant). Extreme negative = capitulation = bottom. Positive = stability.",
     ),
     IndicatorSpec(
         key="gamma_flip_zone", label="Gamma Flip Zone Distance (%)",
-        bucket="sentiment_positioning", source="computed: SPY gamma zero-crossing",
+        bucket="sentiment_positioning", source="CBOE delayed SPY options / GEX proxy",
         direction="contrarian_high_is_top",
         description="Distance to 'zero gamma' price where dealer hedging flips from buy-to-sell to sell-to-buy. Near/past flip = volatility expansion = bottom risk.",
     ),
@@ -264,7 +264,7 @@ INDICATORS: list[IndicatorSpec] = [
     # 12. Enhanced Institutional Positioning
     IndicatorSpec(
         key="index_put_call", label="Index Put/Call Ratio (Institutional Hedging)",
-        bucket="sentiment_positioning", source="computed: Index options",
+        bucket="sentiment_positioning", source="CBOE/YCharts",
         direction="contrarian_high_is_top",
         description="Institutions hedge portfolios with index puts (not equity puts). Spike = panic hedging by smart money. Extreme spike then rapid drop = hedges monetized = bottom.",
     ),
