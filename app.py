@@ -42,6 +42,11 @@ from src.config import (
     INDICATORS,
     INDICATORS_BY_KEY,
     regime_label,
+    DEFAULT_REGIME_COLORS,
+    get_regime_color_for_score,
+    get_regime_step_config,
+    get_regime_name_for_score,
+    get_regime_band_alpha,
 )
 from src.indicators import (
     build_raw,
@@ -439,9 +444,15 @@ st.markdown(f"## Market Regime — {datetime.now().strftime('%A, %b %d %Y')}")
 
 hc1, hc_exp, hc2, hc3, hc4 = st.columns([1.25, 1.4, 0.95, 0.95, 1.0])
 
+gauge_steps = get_regime_step_config(DEFAULT_REGIME_COLORS)
+
 with hc1:
     st.markdown("**Composite Regime Score**")
     score_val = composite_score if not np.isnan(composite_score) else 0
+
+    if "regime_band_filter" not in st.session_state:
+        st.session_state.regime_band_filter = None
+
     gauge = go.Figure(go.Indicator(
         mode="gauge+number",
         value=score_val,
@@ -451,15 +462,7 @@ with hc1:
             "bar": {"color": "rgba(0,0,0,0)", "thickness": 0},
             "bgcolor": "rgba(0,0,0,0)",
             "borderwidth": 0,
-            "steps": [
-                {"range": [0, 15],   "color": "#16a085"},
-                {"range": [15, 35],  "color": "#27ae60"},
-                {"range": [35, 45],  "color": "#3498db"},
-                {"range": [45, 55],  "color": "#95a5a6"},
-                {"range": [55, 65],  "color": "#f1c40f"},
-                {"range": [65, 85],  "color": "#e67e22"},
-                {"range": [85, 100], "color": "#c0392b"},
-            ],
+            "steps": gauge_steps,
             "threshold": {
                 "line": {"color": "#ffffff", "width": 7},
                 "thickness": 1.0,
@@ -479,6 +482,24 @@ with hc1:
         f"<b>{label}</b></div>",
         unsafe_allow_html=True,
     )
+
+    # Regime-band chart filter (dropdown — reliable vs Plotly click in Streamlit)
+    opts: list[tuple[str, str | None]] = [("All regimes", None)]
+    for min_s, max_s, _hex_c, name in DEFAULT_REGIME_COLORS:
+        opts.append((f"{min_s:.0f}–{max_s:.0f} · {name.replace('_', ' ').title()}", name))
+
+    labels = [o[0] for o in opts]
+    cur = st.session_state.regime_band_filter
+    cur_idx = next((i for i, (_, n) in enumerate(opts) if n == cur), 0)
+
+    selected = st.selectbox(
+        "Regime bands filter",
+        options=labels,
+        index=cur_idx,
+        key="regime_band_filter_select",
+        help="Show only the selected regime color in SPX/Russell/Nasdaq regime-band charts.",
+    )
+    st.session_state.regime_band_filter = next(n for lbl, n in opts if lbl == selected)
 
 with hc_exp:
     st.markdown("**Recommended Exposure**")
@@ -797,16 +818,28 @@ st.dataframe(styled, width="stretch", hide_index=True)
 # ---------------------------------------------------------------------------
 # MAJOR INDICES + HISTORICAL REGIME OVERLAY
 # ---------------------------------------------------------------------------
-def _regime_color_for_score(v: float) -> str:
+def _regime_color_for_score(v: float, band_filter_name: str | None = None) -> str:
+    """
+    Return rgba color for regime band background.
+    
+    Args:
+        v: Score value (0-100)
+        band_filter_name: If set, show ONLY this regime's bands (others transparent)
+    """
     if np.isnan(v):
         return "rgba(127,127,127,0.0)"
-    if v >= 85:   return "rgba(192, 57, 43, 0.22)"
-    if v >= 65:   return "rgba(230,126, 34, 0.18)"
-    if v >= 55:   return "rgba(241,196, 15, 0.14)"
-    if v >= 45:   return "rgba(149,165,166, 0.10)"
-    if v >= 35:   return "rgba( 52,152,219, 0.14)"
-    if v >= 15:   return "rgba( 39,174, 96, 0.18)"
-    return            "rgba( 22,160,133, 0.22)"
+
+    for min_s, max_s, hex_c, name in DEFAULT_REGIME_COLORS:
+        if min_s <= v < max_s or (max_s == 100 and v >= min_s):
+            # If user picked a single regime, hide all others
+            if band_filter_name is not None and name != band_filter_name:
+                return "rgba(127,127,127,0.0)"
+
+            # Default: show all regimes; Filtered: show selected regime brighter
+            alpha = 0.18 if band_filter_name is None else 0.35
+            return get_regime_color_for_score(v, DEFAULT_REGIME_COLORS, alpha)
+
+    return "rgba(127,127,127,0.0)"
 
 
 def _render_index_regime_overlay(
@@ -814,10 +847,12 @@ def _render_index_regime_overlay(
     price_full: pd.Series | None,
     trace_name: str,
     yaxis_title: str,
+    band_filter_name: str | None = None,
 ) -> None:
     st.markdown(f"### {section_title}")
     st.caption(
         "Background color = composite regime on that day (same scale as the gauge). "
+        "Optional filter: show only one regime band color. "
         "Lets you eyeball every past top/bottom call at once: red bands before drawdowns, "
         "green bands before rallies."
     )
@@ -836,7 +871,8 @@ def _render_index_regime_overlay(
     comp_aligned = comp_plot.reindex(price_plot.index, method="ffill")
 
     # Collapse consecutive same-color days into single vrects for performance
-    colors = comp_aligned.apply(_regime_color_for_score)
+    # Pass optional filter so only the selected regime is shown
+    colors = comp_aligned.apply(lambda v: _regime_color_for_score(v, band_filter_name))
     segments: list[tuple[pd.Timestamp, pd.Timestamp, str]] = []
     if not colors.empty:
         seg_start = colors.index[0]
@@ -929,18 +965,28 @@ def _index_series(key: str) -> pd.Series:
     return s if s is not None else pd.Series(dtype=float)
 
 
-_render_index_regime_overlay("SPX with historical regime bands", raw.series.get("spx", pd.Series(dtype=float)), "SPX", "SPX")
+band_filter_name = st.session_state.get("regime_band_filter", None)
+
+_render_index_regime_overlay(
+    "SPX with historical regime bands",
+    raw.series.get("spx", pd.Series(dtype=float)),
+    "SPX",
+    "SPX",
+    band_filter_name,
+)
 _render_index_regime_overlay(
     "Russell 2000 with historical regime bands",
     _index_series("russell2000"),
     "Russell 2000",
     "RUT",
+    band_filter_name,
 )
 _render_index_regime_overlay(
     "Nasdaq Composite with historical regime bands",
     _index_series("nasdaq"),
     "Nasdaq",
     "IXIC",
+    band_filter_name,
 )
 
 

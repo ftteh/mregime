@@ -16,6 +16,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Literal
 
+import numpy as np
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -282,6 +283,69 @@ REGIME_THRESHOLDS = {
     "extreme_fear": 15,
 }
 
+# Default regime colors (gauge steps + regime band backgrounds)
+# Each entry: (min_score, max_score, hex_color, regime_name)
+DEFAULT_REGIME_COLORS: list[tuple[float, float, str, str]] = [
+    (0, 15, "#16a085", "capitulation"),      # Dark teal - aggressive accumulation
+    (15, 35, "#27ae60", "extreme_fear"),     # Green - panic/accumulate
+    (35, 45, "#3498db", "fearful"),          # Blue - fearful/watch
+    (45, 55, "#95a5a6", "neutral"),            # Gray - neutral
+    (55, 65, "#f1c40f", "neutral_high"),     # Yellow - neutral/late-cycle
+    (65, 85, "#e67e22", "complacent"),       # Orange - complacent
+    (85, 100, "#c0392b", "extreme_complacency"),  # Red - extreme complacency
+]
+
+
+def get_regime_color_for_score(
+    score: float,
+    colors: list[tuple[float, float, str, str]] | None = None,
+    alpha: float = 1.0,
+) -> str:
+    """
+    Return hex color (with optional alpha) for a given score.
+    
+    Args:
+        score: 0-100 composite score
+        colors: Optional custom color configuration (defaults to DEFAULT_REGIME_COLORS)
+        alpha: Opacity 0-1 for rgba output (1.0 = solid hex, <1 = rgba string)
+    """
+    if np.isnan(score):
+        return "rgba(127,127,127,0.0)" if alpha < 1.0 else "#7f8c8d"
+    
+    palette = colors if colors else DEFAULT_REGIME_COLORS
+    for min_s, max_s, hex_c, _ in palette:
+        if min_s <= score < max_s or (max_s == 100 and score >= min_s):
+            if alpha < 1.0:
+                # Convert hex to rgba
+                hex_c = hex_c.lstrip("#")
+                r = int(hex_c[0:2], 16)
+                g = int(hex_c[2:4], 16)
+                b = int(hex_c[4:6], 16)
+                return f"rgba({r},{g},{b},{alpha})"
+            return hex_c
+    return "#7f8c8d"
+
+
+def get_regime_step_config(
+    colors: list[tuple[float, float, str, str]] | None = None,
+) -> list[dict]:
+    """Return Plotly gauge step configuration from regime colors."""
+    palette = colors if colors else DEFAULT_REGIME_COLORS
+    return [
+        {"range": [min_s, max_s], "color": hex_c}
+        for min_s, max_s, hex_c, _ in palette
+    ]
+
+
+def get_regime_band_alpha(regime_name: str, is_active: bool = False) -> float:
+    """
+    Return alpha transparency for regime band backgrounds.
+    Active (matching current gauge regime) gets brighter/higher alpha.
+    """
+    base_alpha = 0.10
+    active_alpha = 0.35
+    return active_alpha if is_active else base_alpha
+
 
 def regime_label(score: float) -> tuple[str, str, str]:
     """Return (label, emoji, color) for a 0-100 composite score."""
@@ -298,3 +362,11 @@ def regime_label(score: float) -> tuple[str, str, str]:
     if score >= REGIME_THRESHOLDS["extreme_fear"]:
         return "PANIC — Accumulate quality", "V", "#27ae60"
     return "CAPITULATION — Aggressive accumulation zone", "VV", "#16a085"
+
+
+def get_regime_name_for_score(score: float) -> str:
+    """Return regime name identifier for a given score."""
+    for min_s, max_s, _, name in DEFAULT_REGIME_COLORS:
+        if min_s <= score < max_s or (max_s == 100 and score >= min_s):
+            return name
+    return "unknown"
