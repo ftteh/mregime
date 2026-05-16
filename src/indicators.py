@@ -4,14 +4,19 @@ orient them so HIGH = top-risk / complacency, and produce the composite.
 """
 from __future__ import annotations
 
+import logging
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Dict
+from typing import Callable, Dict
 
 import numpy as np
 import pandas as pd
 
 from . import data as D
 from .config import BUCKET_WEIGHTS, INDICATORS_BY_KEY, ROLLING_WINDOW_DAYS
+
+log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -22,9 +27,16 @@ def rolling_percentile(s: pd.Series, window: int = ROLLING_WINDOW_DAYS) -> pd.Se
     if s is None or s.empty:
         return pd.Series(dtype=float)
     win = min(window, max(30, len(s) // 2 if len(s) > 60 else len(s)))
+
+    def _last_rank_pct(x: np.ndarray) -> float:
+        x = x[~np.isnan(x)]
+        if x.size == 0:
+            return np.nan
+        return float((x <= x[-1]).mean() * 100.0)
+
     r = s.rolling(win, min_periods=max(30, win // 4)).apply(
-        lambda x: (x.rank(pct=True).iloc[-1] * 100.0) if len(x) > 0 else np.nan,
-        raw=False,
+        _last_rank_pct,
+        raw=True,
     )
     return r
 
@@ -81,80 +93,147 @@ class RawFrame:
     meta: Dict[str, dict]
 
 
+def _empty_series(name: str = "") -> pd.Series:
+    return pd.Series(dtype=float, name=name or None)
+
+
+def _max_fetch_workers(task_count: int) -> int:
+    default_workers = 10
+    try:
+        configured = int(os.getenv("QUANT_DASH_MAX_WORKERS", str(default_workers)))
+    except ValueError:
+        configured = default_workers
+    return max(1, min(task_count, configured))
+
+
+def _fetch_parallel(tasks: dict[str, Callable[[], pd.Series]]) -> Dict[str, pd.Series]:
+    """
+    Fetch independent IO-bound data sources concurrently.
+
+    Most dashboard latency is network/API wait time (FRED, yfinance, CBOE,
+    CFTC, CNN, etc.). Keeping each fetcher isolated preserves the existing
+    failure behavior: one dead source becomes an empty series, not a dead app.
+    """
+    if not tasks:
+        return {}
+
+    out: Dict[str, pd.Series] = {}
+    with ThreadPoolExecutor(max_workers=_max_fetch_workers(len(tasks))) as executor:
+        future_to_key = {executor.submit(fn): key for key, fn in tasks.items()}
+        for future in as_completed(future_to_key):
+            key = future_to_key[future]
+            try:
+                value = future.result()
+                out[key] = value if isinstance(value, pd.Series) else _empty_series(key)
+            except Exception as e:
+                log.info("raw fetch failed for %s: %s", key, str(e)[:120])
+                out[key] = _empty_series(key)
+    return out
+
+
+def _ad_line_proxy() -> pd.Series:
+    """A/D line proxy: sign of daily returns across a liquid S&P sample."""
+    try:
+        tickers = D.sp500_tickers()[:100]
+        import yfinance as yf
+        dl = yf.download(
+            tickers,
+            period="1y",
+            progress=False,
+            auto_adjust=False,
+            group_by="ticker",
+            threads=True,
+        )
+        rets = pd.DataFrame({
+            t: dl[t]["Close"].pct_change()
+            for t in tickers
+            if t in dl.columns.get_level_values(0)
+        })
+        ad = (rets > 0).sum(axis=1) - (rets < 0).sum(axis=1)
+        ad.name = "ad_line_slope"
+        return ad.cumsum()
+    except Exception as e:
+        log.info("A/D line proxy failed: %s", str(e)[:120])
+        return _empty_series("ad_line_slope")
+
+
+def _aaii_bull_bear_spread() -> pd.Series:
+    try:
+        aaii = D.aaii_sentiment()
+        return aaii["spread"] if "spread" in aaii.columns else _empty_series("aaii_bull_bear")
+    except Exception as e:
+        log.info("AAII fetch failed: %s", str(e)[:120])
+        return _empty_series("aaii_bull_bear")
+
+
 def build_raw() -> RawFrame:
     s: Dict[str, pd.Series] = {}
     meta: Dict[str, dict] = {}
 
-    # ---- Credit & Liquidity
-    s["hy_spread"] = D.fred_hy_spread()
-    s["ig_spread"] = D.fred_ig_spread()
-    s["net_liquidity"] = D.fred_net_liquidity()
-    s["financial_conditions"] = D.fred_nfci()
-    s["move_index"] = D.move_index()
+    tasks: dict[str, Callable[[], pd.Series]] = {
+        # ---- Credit & Liquidity
+        "hy_spread": D.fred_hy_spread,
+        "ig_spread": D.fred_ig_spread,
+        "net_liquidity": D.fred_net_liquidity,
+        "financial_conditions": D.fred_nfci,
+        "move_index": D.move_index,
 
-    # ---- Market / Breadth / Momentum
-    spx_px = D.spx()
+        # ---- Market / Breadth / Momentum
+        "spx": D.spx,
+        "pct_above_200dma": D.breadth_pct_above_200dma,
+        "new_highs_lows": D.new_highs_minus_lows,
+        "ad_line_slope": _ad_line_proxy,
+
+        # ---- Sentiment & Positioning
+        "naaim": D.naaim_exposure,
+        "aaii_bull_bear": _aaii_bull_bear_spread,
+        "fear_greed": D.fear_greed_index,
+        "put_call": D.put_call_ratio,
+        "vix": D.vix,
+        "vvix": D.vvix,
+        "skew": D.skew,
+
+        # ---- Valuation
+        "equity_risk_premium": D.equity_risk_premium,
+
+        # ---- Advanced / bonus
+        "corr_cluster": D.correlation_cluster,
+        "move_vix_div": D.move_vs_vix_spread,
+        "dix": D.dix_proxy,
+        "cta_positioning": D.cftc_cta_positioning,
+        "russell2000": D.russell2000,
+        "nasdaq": D.nasdaq_composite,
+
+        # ---- VIX term structure
+        "vix_term_9d_1m": D.vix_term_9d_1m,
+        "vix_term_1m_3m": D.vix_term_1m_3m,
+
+        # ---- Yield curve + re-steepening
+        "curve_2s10s": D.curve_2s10s,
+        "curve_3m10y": D.curve_3m10y,
+        "curve_resteep_2s10s": D.curve_resteep_2s10s,
+
+        # ---- Credit spread velocity
+        "hy_spread_velocity": D.hy_spread_velocity,
+
+        # ---- Macro context
+        "dxy": D.dxy,
+        "real_yield_10y": D.real_yield_10y,
+        "copper_gold": D.copper_gold_ratio,
+
+        # ---- Interbank Funding / Repo Market Stress
+        "fra_ois_spread": D.fra_ois_spread,
+        "sofr_spread": D.sofr_spread,
+
+        # ---- Gamma Exposure / Options Market Structure
+        "gamma_exposure": D.gamma_exposure_proxy,
+        "gamma_flip_zone": D.gamma_flip_zone_distance,
+        "index_put_call": D.index_put_call_ratio,
+    }
+    s.update(_fetch_parallel(tasks))
+
+    spx_px = s.get("spx", _empty_series("spx"))
     s["rsi_spx"] = rsi(spx_px, 14) if not spx_px.empty else pd.Series(dtype=float)
-    s["pct_above_200dma"] = D.breadth_pct_above_200dma()
-    s["new_highs_lows"] = D.new_highs_minus_lows()
-    # A/D line proxy: use sign of daily returns across sample
-    try:
-        tickers = D.sp500_tickers()[:100]
-        import yfinance as yf
-        dl = yf.download(tickers, period="1y", progress=False, auto_adjust=False, group_by="ticker", threads=True)
-        rets = pd.DataFrame({t: dl[t]["Close"].pct_change() for t in tickers if t in dl.columns.get_level_values(0)})
-        ad = (rets > 0).sum(axis=1) - (rets < 0).sum(axis=1)
-        s["ad_line_slope"] = ad.cumsum()
-    except Exception:
-        s["ad_line_slope"] = pd.Series(dtype=float)
-
-    # ---- Sentiment & Positioning
-    aaii = D.aaii_sentiment()
-    s["aaii_bull_bear"] = aaii["spread"] if "spread" in aaii.columns else pd.Series(dtype=float)
-    s["naaim"] = D.naaim_exposure()
-    s["fear_greed"] = D.fear_greed_index()
-    s["put_call"] = D.put_call_ratio()
-    s["vix"] = D.vix()
-    s["vvix"] = D.vvix()
-    s["skew"] = D.skew()
-
-    # ---- Valuation
-    s["equity_risk_premium"] = D.equity_risk_premium()
-
-    # ---- Advanced / bonus
-    s["corr_cluster"] = D.correlation_cluster()
-    s["move_vix_div"] = D.move_vs_vix_spread()
-    s["dix"] = D.dix_proxy()
-    s["cta_positioning"] = D.cftc_cta_positioning()
-    s["spx"] = spx_px
-    s["russell2000"] = D.russell2000()
-    s["nasdaq"] = D.nasdaq_composite()
-
-    # ---- VIX term structure
-    s["vix_term_9d_1m"] = D.vix_term_9d_1m()
-    s["vix_term_1m_3m"] = D.vix_term_1m_3m()
-
-    # ---- Yield curve + re-steepening
-    s["curve_2s10s"] = D.curve_2s10s()
-    s["curve_3m10y"] = D.curve_3m10y()
-    s["curve_resteep_2s10s"] = D.curve_resteep_2s10s()
-
-    # ---- Credit spread velocity
-    s["hy_spread_velocity"] = D.hy_spread_velocity()
-
-    # ---- Macro context
-    s["dxy"] = D.dxy()
-    s["real_yield_10y"] = D.real_yield_10y()
-    s["copper_gold"] = D.copper_gold_ratio()
-
-    # ---- Interbank Funding / Repo Market Stress
-    s["fra_ois_spread"] = D.fra_ois_spread()
-    s["sofr_spread"] = D.sofr_spread()
-
-    # ---- Gamma Exposure / Options Market Structure
-    s["gamma_exposure"] = D.gamma_exposure_proxy()
-    s["gamma_flip_zone"] = D.gamma_flip_zone_distance()
-    s["index_put_call"] = D.index_put_call_ratio()
 
     # Metadata (current value + freshness)
     for k, v in s.items():
