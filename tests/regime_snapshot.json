@@ -1,0 +1,51 @@
+{
+  "buckets": {
+    "breadth_momentum": 42.703,
+    "credit_liquidity": 52.664,
+    "sentiment_positioning": 46.7113,
+    "valuation": 82.1632
+  },
+  "cluster": {
+    "bottom_cluster_count": 5,
+    "bottom_theme_count": 4,
+    "top_cluster_count": 4,
+    "top_theme_count": 4
+  },
+  "comp_hist_last": 51.4351,
+  "composite": 51.4351,
+  "covered_weight": 1.0,
+  "scores": {
+    "aaii_bull_bear": 35.3519,
+    "ad_line_slope": 51.1905,
+    "copper_gold": 61.3445,
+    "cta_positioning": 77.381,
+    "curve_2s10s": 49.5913,
+    "curve_3m10y": 24.7475,
+    "curve_resteep_2s10s": 47.769,
+    "dxy": 46.0,
+    "equity_risk_premium": 82.1632,
+    "fear_greed": 55.0336,
+    "financial_conditions": 64.1827,
+    "fra_ois_spread": 3.8369,
+    "gamma_exposure": 18.1818,
+    "gamma_flip_zone": 32.2222,
+    "hy_spread": null,
+    "hy_spread_velocity": 63.5906,
+    "ig_spread": null,
+    "index_put_call": 32.8018,
+    "move_index": null,
+    "naaim": 51.2346,
+    "net_liquidity": 30.9963,
+    "new_highs_lows": 94.5364,
+    "pct_above_200dma": 14.5161,
+    "put_call": 99.169,
+    "real_yield_10y": 99.5261,
+    "rsi_spx": 10.5691,
+    "skew": 19.6457,
+    "sofr_spread": 87.7193,
+    "vix": 45.4082,
+    "vix_term_1m_3m": 2.5918,
+    "vix_term_9d_1m": 77.686,
+    "vvix": 13.4228
+  }
+}

@@ -14,7 +14,13 @@ import numpy as np
 import pandas as pd
 
 from . import data as D
-from .config import BUCKET_WEIGHTS, INDICATORS_BY_KEY, ROLLING_WINDOW_DAYS
+from .config import (
+    BUCKET_WEIGHTS,
+    INDICATORS_BY_KEY,
+    MIN_OBS,
+    ROLLING_WINDOW_DAYS,
+    theme_for,
+)
 
 log = logging.getLogger(__name__)
 
@@ -59,6 +65,23 @@ def orient_score(pct: float, direction: str) -> float:
     if direction == "contrarian_high_is_top":
         return 100.0 - pct
     return pct
+
+
+def apply_transform(s: pd.Series, transform: str | None, window: int = 252) -> pd.Series:
+    """Pre-percentile transform for non-stationary series.
+
+    "zscore" re-centres a trending series on its own rolling regime so the
+    downstream percentile measures deviation-from-trend rather than absolute
+    level (which would pin at 0/100 during long drifts). Monotonic within each
+    window, so the indicator's direction/orientation is unchanged.
+    """
+    if transform != "zscore" or s is None or s.empty:
+        return s
+    win = min(window, max(30, len(s) // 2 if len(s) > 60 else len(s)))
+    mean = s.rolling(win, min_periods=max(30, win // 4)).mean()
+    std = s.rolling(win, min_periods=max(30, win // 4)).std()
+    z = (s - mean) / std.replace(0, np.nan)
+    return z.dropna()
 
 
 # ---------------------------------------------------------------------------
@@ -249,14 +272,35 @@ def build_raw() -> RawFrame:
 # ---------------------------------------------------------------------------
 # Composite scoring
 # ---------------------------------------------------------------------------
-def score_indicators(raw: RawFrame) -> pd.DataFrame:
-    """Return DataFrame: key | label | bucket | raw | percentile | score | direction."""
+def score_indicators(raw: RawFrame, per_indicator: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Return DataFrame: key | label | bucket | raw | percentile | score | direction.
+
+    The live score is the most recent point of per_indicator_history (same engine
+    as the regime-band chart), so the gauge endpoint matches the chart endpoint
+    and weekly/daily indicators share one calendar window. Indicators below
+    MIN_OBS observations — or whose history is too short for the percentile's
+    min_periods — resolve to NaN and are dropped from the composite and cluster.
+    """
+    df = per_indicator_history(raw) if per_indicator is None else per_indicator
     rows = []
     for key, spec in INDICATORS_BY_KEY.items():
         series = raw.series.get(key, pd.Series(dtype=float))
-        raw_value = float(series.iloc[-1]) if not series.empty else np.nan
-        pct = latest_percentile(series)
-        score = orient_score(pct, spec.direction)
+        raw_value = float(series.iloc[-1]) if series is not None and not series.empty else np.nan
+        n_obs = int(raw.meta.get(key, {}).get("n", 0))
+
+        score = np.nan
+        if df is not None and not df.empty and key in df.columns and n_obs >= MIN_OBS:
+            col = df[key].dropna()
+            if not col.empty:
+                score = float(col.iloc[-1])
+        # Back-derive the displayed percentile from the oriented score.
+        if np.isnan(score):
+            pct = np.nan
+        elif spec.direction == "contrarian_high_is_top":
+            pct = 100.0 - score
+        else:
+            pct = score
+
         rows.append({
             "key": key,
             "label": spec.label,
@@ -266,8 +310,9 @@ def score_indicators(raw: RawFrame) -> pd.DataFrame:
             "percentile": pct,
             "score": score,
             "weight": spec.weight,
+            "theme": theme_for(key),
             "as_of": raw.meta.get(key, {}).get("as_of"),
-            "n_obs": raw.meta.get(key, {}).get("n", 0),
+            "n_obs": n_obs,
         })
     return pd.DataFrame(rows)
 
@@ -286,23 +331,49 @@ def composite(scores_df: pd.DataFrame) -> dict:
         bucket_scores[bucket] = {"score": score, "weight": weight, "n": int(len(sub))}
 
     valid = [b for b in bucket_scores.values() if not np.isnan(b["score"])]
+    all_weight = sum(BUCKET_WEIGHTS.values())
+    covered_weight = (sum(b["weight"] for b in valid) / all_weight) if all_weight else 0.0
     if not valid:
-        return {"composite": np.nan, "buckets": bucket_scores}
+        return {"composite": np.nan, "buckets": bucket_scores, "covered_weight": 0.0}
     total_w = sum(b["weight"] for b in valid)
     comp = sum(b["score"] * b["weight"] for b in valid) / total_w
-    return {"composite": float(comp), "buckets": bucket_scores}
+    return {
+        "composite": float(comp),
+        "buckets": bucket_scores,
+        # Fraction of the model's total bucket weight that actually has data.
+        # < 1.0 means the composite was renormalised over a partial model (e.g.
+        # no FRED key → the 40% Credit pillar is dark) — surfaced as confidence.
+        "covered_weight": float(covered_weight),
+    }
 
 
 # ---------------------------------------------------------------------------
 # Cluster detection — "are we in a confluence top/bottom?"
 # ---------------------------------------------------------------------------
 def cluster_signal(scores_df: pd.DataFrame) -> dict:
-    """Count how many indicators are in extreme territory (both directions)."""
+    """Detect a confluence of extremes — counting independent THEMES, not raw
+    indicators, so a single vol event (VIX/VVIX/SKEW/term-structure all firing)
+    counts once rather than four times. Also reports how many buckets the
+    extremes span, so the override can require cross-pillar confirmation.
+    """
     extreme_top = scores_df[scores_df["score"] >= 85]
     extreme_bot = scores_df[scores_df["score"] <= 15]
+
+    def _themes(df: pd.DataFrame) -> int:
+        if df.empty or "theme" not in df.columns:
+            return int(len(df))
+        return int(df["theme"].nunique())
+
     return {
+        # Raw indicator counts (kept for display continuity)
         "top_cluster_count": int(len(extreme_top)),
         "bottom_cluster_count": int(len(extreme_bot)),
+        # De-duplicated independent-theme counts (drive the override)
+        "top_theme_count": _themes(extreme_top),
+        "bottom_theme_count": _themes(extreme_bot),
+        # Cross-pillar breadth of the extremes
+        "top_buckets": sorted(extreme_top["bucket"].unique().tolist()),
+        "bottom_buckets": sorted(extreme_bot["bucket"].unique().tolist()),
         "top_names": extreme_top["label"].tolist(),
         "bottom_names": extreme_bot["label"].tolist(),
     }
@@ -311,17 +382,28 @@ def cluster_signal(scores_df: pd.DataFrame) -> dict:
 # ---------------------------------------------------------------------------
 # Historical composite — reconstruct the regime score over time
 # ---------------------------------------------------------------------------
-def historical_pillar_scores(raw: RawFrame) -> pd.DataFrame:
+def per_indicator_history(raw: RawFrame) -> pd.DataFrame:
     """
-    Daily DataFrame with one column per pillar, values = pillar score 0-100 over time.
-    Built purely from past data via rolling_percentile (no look-ahead).
+    Daily (business-day) DataFrame, one column per indicator, values = the
+    oriented 0-100 top-risk score over time. Built purely from past data via
+    rolling_percentile (point-in-time, no look-ahead).
 
-    Used by the SPX regime-overlay chart and by pillar_momentum().
+    This is the single source of truth for scoring: the live gauge reads the
+    last row (see score_indicators) and the regime-band chart / pillar momentum
+    aggregate the full history — so the gauge can never disagree with the chart
+    endpoint. Indicators with too little history (min_periods) stay NaN and are
+    excluded everywhere downstream.
     """
     per_indicator: Dict[str, pd.Series] = {}
     for key, spec in INDICATORS_BY_KEY.items():
         s = raw.series.get(key, pd.Series(dtype=float))
         if s is None or s.empty:
+            continue
+        # Single min-observation gate, enforced here so the live scores (last row)
+        # and the historical chart exclude exactly the same thin indicators —
+        # otherwise a 30-59-obs series would be gated live but counted on the
+        # chart, breaking the gauge==chart-endpoint guarantee.
+        if int(raw.meta.get(key, {}).get("n", 0)) < MIN_OBS:
             continue
         # Resample to business-day grid so pillar avg aligns across mixed frequencies.
         # Some feeds (AAII/NAAIM/put-call cache) occasionally emit duplicate
@@ -347,20 +429,48 @@ def historical_pillar_scores(raw: RawFrame) -> pd.DataFrame:
         except Exception:
             # Last-resort: skip malformed indicator rather than kill the whole panel
             continue
+        s_d = apply_transform(s_d, spec.transform, spec.transform_window)
+        if s_d.empty:
+            continue
         pct = rolling_percentile(s_d)
         score = pct.apply(lambda p, d=spec.direction: orient_score(p, d))
         per_indicator[key] = score
 
     if not per_indicator:
         return pd.DataFrame()
+    return pd.DataFrame(per_indicator)
 
-    df = pd.DataFrame(per_indicator)
+
+def _weighted_bucket_mean(per_ind: pd.DataFrame, cols: list[str]) -> pd.Series:
+    """Per-row weighted mean of indicator scores in `cols`, skipping NaNs.
+
+    Mirrors composite()'s within-bucket weighting so the historical pillar path
+    and the live composite use one consistent aggregation.
+    """
+    w = np.array([INDICATORS_BY_KEY[c].weight for c in cols], dtype=float)
+    sub = per_ind[cols]
+    mask = sub.notna()
+    num = (sub.fillna(0.0) * w).sum(axis=1)
+    den = (mask * w).sum(axis=1).replace(0, np.nan)
+    return num / den
+
+
+def historical_pillar_scores(raw: RawFrame, per_indicator: pd.DataFrame | None = None) -> pd.DataFrame:
+    """
+    Daily DataFrame with one column per pillar, values = pillar score 0-100 over
+    time (weighted mean of that pillar's indicator scores). Accepts a precomputed
+    per_indicator_history frame to avoid recomputing the rolling-percentile pass.
+    """
+    df = per_indicator_history(raw) if per_indicator is None else per_indicator
+    if df is None or df.empty:
+        return pd.DataFrame()
+
     buckets: Dict[str, pd.Series] = {}
     for bkey in BUCKET_WEIGHTS:
         cols = [k for k, sp in INDICATORS_BY_KEY.items()
                 if sp.bucket == bkey and k in df.columns]
         if cols:
-            buckets[bkey] = df[cols].mean(axis=1, skipna=True)
+            buckets[bkey] = _weighted_bucket_mean(df, cols)
     return pd.DataFrame(buckets)
 
 
@@ -389,9 +499,14 @@ def historical_composite(raw: RawFrame, pillars: pd.DataFrame | None = None) -> 
 # ---------------------------------------------------------------------------
 # Exposure recommendation — map composite score + cluster to an actionable position
 # ---------------------------------------------------------------------------
+CLUSTER_MIN_THEMES = 3   # distinct independent themes needed to fire an override
+CLUSTER_MIN_BUCKETS = 2  # spanning at least this many pillars (cross-confirmation)
+
+
 def exposure_recommendation(
     composite_score: float,
     cluster: dict | None = None,
+    covered_weight: float = 1.0,
 ) -> dict:
     """
     Translate a 0-100 composite regime score (plus optional cluster state) into
@@ -406,9 +521,10 @@ def exposure_recommendation(
       - rationale    : one-line explanation
       - cluster_override : bool — True if cluster forced a deviation from the base mapping
 
-    The rule-of-thumb mapping below is tunable. Cluster overrides:
-      - top_cluster ≥ 4    : -20pp to net, +0.5% to hedge minimum
-      - bottom_cluster ≥ 4 : +15pp to net, hedge cleared
+    Cluster overrides require a confluence of independent THEMES spanning multiple
+    pillars (not a raw indicator count), so one collinear vol event can't fake a
+    high-conviction signal. `covered_weight` (fraction of the model with data)
+    caps conviction: a partial-model reading can never be "High".
     """
     if composite_score is None or (isinstance(composite_score, float) and np.isnan(composite_score)):
         return {
@@ -441,22 +557,37 @@ def exposure_recommendation(
     cluster_override = False
     conviction = "Low"
 
-    top_n = int(cluster.get("top_cluster_count", 0)) if cluster else 0
-    bot_n = int(cluster.get("bottom_cluster_count", 0)) if cluster else 0
+    # Theme-deduplicated counts + cross-pillar breadth drive the override.
+    top_themes = int(cluster.get("top_theme_count", cluster.get("top_cluster_count", 0))) if cluster else 0
+    bot_themes = int(cluster.get("bottom_theme_count", cluster.get("bottom_cluster_count", 0))) if cluster else 0
+    top_buckets = len(cluster.get("top_buckets", [])) if cluster else 0
+    bot_buckets = len(cluster.get("bottom_buckets", [])) if cluster else 0
+
+    # Fire on a cross-pillar confluence (≥3 themes spanning ≥2 buckets) OR a
+    # strong single-pillar one (≥4 distinct themes) — the latter so a genuine
+    # credit-led blowout, whose themes all live in the credit_liquidity pillar,
+    # is not silently blocked by the cross-pillar requirement.
+    def _fires(themes: int, buckets: int) -> bool:
+        return themes >= CLUSTER_MIN_THEMES and (
+            buckets >= CLUSTER_MIN_BUCKETS or themes >= CLUSTER_MIN_THEMES + 1
+        )
+
+    top_fire = _fires(top_themes, top_buckets)
+    bot_fire = _fires(bot_themes, bot_buckets)
 
     # Cluster overrides — the whole point of clusters is they trump noise
-    if top_n >= 4:
+    if top_fire:
         net = max(0, net - 20)
         hedge = max(hedge, 0.5) + 0.5  # at least 0.5%, plus 0.5 more on top
         cluster_override = True
-        label = f"TOP CLUSTER ({top_n}) — CUT"
+        label = f"TOP CLUSTER ({top_themes} themes) — CUT"
         color = "#c0392b"
         conviction = "High"
-    elif bot_n >= 4:
+    elif bot_fire:
         net = min(150, net + 15)
         hedge = 0.0
         cluster_override = True
-        label = f"BOTTOM CLUSTER ({bot_n}) — ADD"
+        label = f"BOTTOM CLUSTER ({bot_themes} themes) — ADD"
         color = "#16a085"
         conviction = "High"
     else:
@@ -468,13 +599,23 @@ def exposure_recommendation(
         else:
             conviction = "Medium"
 
+    # Partial-model honesty gate: a reading off an incomplete model (e.g. the
+    # 40%-weight Credit pillar offline) is capped at Low conviction.
+    low_coverage = covered_weight < 0.8
+    if low_coverage:
+        conviction = "Low"
+
     rationale_bits: list[str] = []
     if cluster_override:
+        themes = top_themes if top_fire else bot_themes
+        buckets = top_buckets if top_fire else bot_buckets
         rationale_bits.append(
-            f"{top_n or bot_n} indicators clustered at "
-            f"{'top' if top_n >= 4 else 'bottom'} — overrides base reading"
+            f"{themes} independent themes across {buckets} pillars clustered at "
+            f"{'top' if top_fire else 'bottom'} — overrides base reading"
         )
     rationale_bits.append(f"composite {s:.0f}")
+    if low_coverage:
+        rationale_bits.append(f"only {covered_weight*100:.0f}% of model has data")
     rationale = " · ".join(rationale_bits)
 
     return {
@@ -485,6 +626,7 @@ def exposure_recommendation(
         "conviction": conviction,
         "rationale": rationale,
         "cluster_override": cluster_override,
+        "covered_weight": float(covered_weight),
     }
 
 

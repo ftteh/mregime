@@ -56,6 +56,7 @@ from src.indicators import (
     historical_composite,
     historical_pillar_scores,
     latest_percentile,
+    per_indicator_history,
     orient_score,
     pillar_momentum,
     score_indicators,
@@ -111,13 +112,15 @@ st.markdown(
 @st.cache_data(ttl=60 * 60, show_spinner="Pulling institutional data…")
 def load_all():
     raw = build_raw()
-    scores = score_indicators(raw)
+    # Single scoring engine: per_indicator_history is the one rolling-percentile
+    # pass. The live scores read its last row; the pillar/composite history
+    # aggregate the full frame — so the gauge can't disagree with the chart, and
+    # the heavy CPU step runs exactly once.
+    per_ind = per_indicator_history(raw)
+    scores = score_indicators(raw, per_indicator=per_ind)
     comp = composite(scores)
     cluster = cluster_signal(scores)
-    # historical_pillar_scores runs the rolling-percentile pass for every
-    # indicator — the heaviest CPU step. Compute it once and feed both
-    # consumers instead of paying for it twice.
-    pillars = historical_pillar_scores(raw)
+    pillars = historical_pillar_scores(raw, per_indicator=per_ind)
     momentum = pillar_momentum(raw, pillars=pillars)
     comp_hist = historical_composite(raw, pillars=pillars)
     return raw, scores, comp, cluster, momentum, comp_hist
@@ -299,7 +302,12 @@ def _line(
     if plot_s.empty:
         st.info(f"{title}: no data in last {CHART_LOOKBACK_YEARS} years")
         return
-    line_color = _top_risk_to_line_color(score if not np.isnan(score) else None)
+    score_color = _top_risk_to_line_color(score if not np.isnan(score) else None)
+    # The series is drawn in a neutral tone: a single scalar (today's score) can't
+    # honestly colour the whole history. Only the CURRENT point carries the
+    # top-risk colour, so the chart shows where the indicator *is now* without
+    # implying the past was that risky.
+    NEUTRAL = "rgb(154,164,173)"
     fig = go.Figure()
     # If the series has only 1-2 points (common for cached daily snapshots like GEX),
     # `mode="lines"` renders nearly invisible. Add markers so "fresh" indicators
@@ -310,13 +318,25 @@ def _line(
             x=plot_s.index,
             y=plot_s.values,
             mode=mode,
-            line=dict(width=2.8, color=line_color),
-            marker=dict(size=7, color=line_color, line=dict(color="rgba(0,0,0,0)", width=0)),
+            line=dict(width=2.2, color=NEUTRAL),
+            marker=dict(size=6, color=NEUTRAL, line=dict(color="rgba(0,0,0,0)", width=0)),
             fill="tozeroy",
-            fillcolor=_rgb_to_rgba(line_color, 0.18),
+            fillcolor=_rgb_to_rgba(NEUTRAL, 0.10),
             name=title,
         )
     )
+    # Current-value dot, coloured by the live top-risk score (green→red).
+    if not np.isnan(score):
+        fig.add_trace(
+            go.Scatter(
+                x=[plot_s.index[-1]],
+                y=[float(plot_s.iloc[-1])],
+                mode="markers",
+                marker=dict(size=11, color=score_color, line=dict(color="#ffffff", width=1.2)),
+                showlegend=False,
+                hovertemplate=f"now · top-risk {score:.0f}<extra></extra>",
+            )
+        )
     if ref_lines:
         for y, lbl in ref_lines:
             fig.add_hline(
@@ -428,7 +448,9 @@ composite_score = comp["composite"]
 label, emoji, color = regime_label(composite_score) if not np.isnan(composite_score) else ("NO DATA", "?", "#555")
 
 # Actionable: map composite + cluster → suggested net exposure + hedge
-exp_rec = exposure_recommendation(composite_score, cluster)
+# covered_weight gates conviction so a partial model can't read "High".
+COVERED_WEIGHT = comp.get("covered_weight", 1.0)
+exp_rec = exposure_recommendation(composite_score, cluster, covered_weight=COVERED_WEIGHT)
 
 # Trend: what was our suggested exposure ~5 business days ago?
 prev_exp = None
@@ -440,6 +462,39 @@ try:
             prev_exp = exposure_recommendation(prev_score, cluster=None)
 except Exception:
     prev_exp = None
+
+
+def _read_confidence(scores_df: pd.DataFrame, covered_weight: float) -> dict:
+    """How much to trust today's composite: model coverage, indicator agreement
+    (score dispersion), and data freshness. Each precise composite number is only
+    as good as how much of the model is online, how aligned it is, and how stale."""
+    scored = scores_df.dropna(subset=["score"])
+    n_contrib, total = int(len(scored)), int(len(scores_df))
+    dispersion = float(scored["score"].std()) if len(scored) > 1 else np.nan
+    now = datetime.now()
+    ages = [
+        (now - pd.Timestamp(a).to_pydatetime().replace(tzinfo=None)).days
+        for a in scored["as_of"].tolist()
+        if a is not None
+    ]
+    staleness = max(ages) if ages else None
+
+    # Three-tier rating from the weakest dimension.
+    if covered_weight >= 0.8 and (staleness is None or staleness <= 10) and (np.isnan(dispersion) or dispersion <= 25):
+        level, color = "High", "#16a085"
+    elif covered_weight >= 0.6 and (staleness is None or staleness <= 21):
+        level, color = "Medium", "#e67e22"
+    else:
+        level, color = "Low", "#c0392b"
+    return {
+        "level": level, "color": color,
+        "coverage_pct": covered_weight * 100.0,
+        "n_contrib": n_contrib, "total": total,
+        "dispersion": dispersion, "staleness": staleness,
+    }
+
+
+CONFIDENCE = _read_confidence(scores, COVERED_WEIGHT)
 
 
 # ---------------------------------------------------------------------------
@@ -485,6 +540,24 @@ with hc1:
     st.markdown(
         f"<div style='text-align:center;'><span class='pill' style='background:{color}'>{emoji}</span>"
         f"<b>{label}</b></div>",
+        unsafe_allow_html=True,
+    )
+
+    # Confidence chip — how much to trust the precise number above.
+    _cf = CONFIDENCE
+    _disp = "—" if _cf["dispersion"] is None or np.isnan(_cf["dispersion"]) else f"{_cf['dispersion']:.0f}"
+    _stale = "—" if _cf["staleness"] is None else f"{_cf['staleness']}d"
+    _agree_txt = "aligned" if (_cf["dispersion"] is not None and not np.isnan(_cf["dispersion"]) and _cf["dispersion"] <= 25) else "mixed"
+    st.markdown(
+        f"""
+<div style='text-align:center; margin-top:8px;'>
+  <span class='pill' style='background:{_cf['color']}'>CONFIDENCE: {_cf['level']}</span>
+  <div class='sub' style='margin-top:4px;'>
+    {_cf['n_contrib']}/{_cf['total']} indicators · {_cf['coverage_pct']:.0f}% of model weight ·
+    spread {_disp} ({_agree_txt}) · freshest gap {_stale}
+  </div>
+</div>
+""",
         unsafe_allow_html=True,
     )
 
@@ -636,13 +709,81 @@ with hc4:
     st.markdown("**Cluster signals**")
     tcnt = cluster["top_cluster_count"]
     bcnt = cluster["bottom_cluster_count"]
-    if tcnt >= 4:
-        st.error(f"TOP CLUSTER · {tcnt} ≥85")
-    elif bcnt >= 4:
-        st.success(f"BOTTOM CLUSTER · {bcnt} ≤15")
+    t_themes = cluster.get("top_theme_count", tcnt)
+    b_themes = cluster.get("bottom_theme_count", bcnt)
+    t_buckets = len(cluster.get("top_buckets", []))
+    b_buckets = len(cluster.get("bottom_buckets", []))
+    if exp_rec.get("cluster_override") and "TOP" in exp_rec.get("label", ""):
+        st.error(f"TOP CLUSTER · {t_themes} themes / {t_buckets} pillars")
+    elif exp_rec.get("cluster_override") and "BOTTOM" in exp_rec.get("label", ""):
+        st.success(f"BOTTOM CLUSTER · {b_themes} themes / {b_buckets} pillars")
     else:
-        st.info(f"No cluster · {tcnt}↑ / {bcnt}↓")
-    st.caption(f"Indicators at extreme: **{tcnt}** top-risk, **{bcnt}** panic. Clusters of 4+ are actionable.")
+        st.info(f"No actionable cluster · {t_themes}↑ / {b_themes}↓ themes")
+    st.caption(
+        f"At extreme: **{tcnt}** top-risk, **{bcnt}** panic indicators "
+        f"(**{t_themes}**/**{b_themes}** independent themes). "
+        "Override needs ≥3 themes across ≥2 pillars — collinear vol counts once."
+    )
+
+
+# ---------------------------------------------------------------------------
+# TODAY'S READ — one-line synthesis so the decision doesn't require eyeballing
+# 20 charts: verdict, what's pulling the score, the fastest mover, divergences.
+# ---------------------------------------------------------------------------
+def _todays_read() -> None:
+    scored = scores.dropna(subset=["score"]).copy()
+    if scored.empty:
+        return
+    # Top contributors: distance from neutral (50) weighted by indicator weight.
+    scored["pull"] = (scored["score"] - 50.0) * scored["weight"].fillna(1.0)
+    top_risk = scored.sort_values("pull", ascending=False).head(3)
+    top_safe = scored.sort_values("pull", ascending=True).head(3)
+
+    def _names(df_):
+        return ", ".join(f"{r.label} ({r.score:.0f})" for r in df_.itertuples()) or "—"
+
+    # Fastest-moving pillar this week (from momentum deltas).
+    mover_txt = "—"
+    if isinstance(momentum, dict) and momentum:
+        best = None
+        for bkey, m in momentum.items():
+            d = m.get("d_1w", np.nan)
+            if d is not None and not np.isnan(d) and (best is None or abs(d) > abs(best[1])):
+                best = (bkey, d)
+        if best is not None:
+            nm = pillar_names.get(best[0], best[0])
+            arrow = "▲ toward top-risk" if best[1] > 0 else "▼ toward bottom"
+            mover_txt = f"{nm} {arrow} ({best[1]:+.1f} in 1w)"
+
+    net_txt = "—" if exp_rec["net_pct"] is None else f"{exp_rec['net_pct']}% net equity"
+    verdict_color = exp_rec["color"]
+    st.markdown(
+        f"""
+<div class='card' style='border-left:4px solid {verdict_color};'>
+  <div style='font-size:1.05rem; font-weight:700; color:#fff; margin-bottom:6px;'>
+    Today's read — {exp_rec['label']} · {net_txt}
+    <span class='pill' style='background:{CONFIDENCE['color']}; margin-left:8px;'>{CONFIDENCE['level']} confidence</span>
+  </div>
+  <div class='sub' style='line-height:1.7;'>
+    <b style='color:#ff8c8c;'>Pulling toward top-risk:</b> {_names(top_risk)}<br>
+    <b style='color:#7fd99a;'>Pulling toward bottom:</b> {_names(top_safe)}<br>
+    <b>Fastest mover:</b> {mover_txt} &nbsp;·&nbsp; <b>Rationale:</b> {exp_rec['rationale']}
+  </div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+
+# pillar_names is needed by the synthesis card; defined just below for the
+# pillar grid too — declare once here so both blocks share it.
+pillar_names = {
+    "credit_liquidity": "Credit & Liquidity",
+    "breadth_momentum": "Breadth & Momentum",
+    "sentiment_positioning": "Sentiment & Positioning",
+    "valuation": "Valuation",
+}
+_todays_read()
 
 
 # ---------------------------------------------------------------------------
@@ -651,12 +792,6 @@ with hc4:
 st.markdown("### The Four Pillars")
 bc = st.columns(4)
 pillar_order = ["credit_liquidity", "breadth_momentum", "sentiment_positioning", "valuation"]
-pillar_names = {
-    "credit_liquidity": "Credit & Liquidity",
-    "breadth_momentum": "Breadth & Momentum",
-    "sentiment_positioning": "Sentiment & Positioning",
-    "valuation": "Valuation",
-}
 for col, bkey in zip(bc, pillar_order):
     info = comp["buckets"].get(bkey, {})
     s = info.get("score", np.nan)

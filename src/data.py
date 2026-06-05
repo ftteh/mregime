@@ -1012,26 +1012,58 @@ def put_call_ratio() -> pd.Series:
 # ---------------------------------------------------------------------------
 # Valuation: Equity Risk Premium
 # ---------------------------------------------------------------------------
+@_memoized_fetch
+def sp500_pe_ratio() -> pd.Series:
+    """
+    S&P 500 trailing P/E (monthly) from multpl.com — no API key. Used to derive
+    a *real* earnings yield for the ERP. Returns empty on failure so the caller
+    can be honestly absent rather than fabricate a constant.
+    """
+    url = "https://www.multpl.com/s-p-500-pe-ratio/table/by-month"
+    try:
+        r = requests.get(url, headers=UA, timeout=12)
+        r.raise_for_status()
+        tables = pd.read_html(io.StringIO(r.text))
+        df = tables[0]
+        df.columns = [str(c).strip() for c in df.columns]
+        if "Date" not in df.columns or "Value" not in df.columns:
+            return pd.Series(dtype=float, name="sp500_pe")
+        dt = pd.to_datetime(df["Date"], errors="coerce")
+        # The Value cell can carry a stray prefix byte ("� 32.69") — extract the number.
+        val = pd.to_numeric(
+            df["Value"].astype(str).str.extract(r"([0-9]+\.?[0-9]*)")[0],
+            errors="coerce",
+        )
+        s = pd.Series(val.values, index=dt).dropna()
+        s = s[s > 0]
+        s = s[~s.index.duplicated(keep="last")].sort_index()
+        s.name = "sp500_pe"
+        return s
+    except Exception as e:
+        log.info("multpl S&P PE unavailable (%s)", str(e)[:80])
+        return pd.Series(dtype=float, name="sp500_pe")
+
+
 def equity_risk_premium() -> pd.Series:
     """
-    ERP = SPX trailing earnings yield - US10Y.
-    We approximate SPX earnings yield from SPY's P/E using a fixed-ish estimate;
-    more robust: use SP500 earnings yield FRED series if available.
-    We use MULT: S&P 500 Shiller PE via multpl (no API). Fall back to SPX 1/PE from yfinance info.
+    ERP = S&P 500 trailing earnings yield (100 / trailing P/E) − 10Y Treasury yield.
+
+    Earnings yield comes from multpl.com's monthly S&P 500 P/E, forward-filled
+    onto the daily yield calendar — a *real* valuation signal that moves with P/E
+    expansion/compression. If the P/E source is unavailable the series is empty
+    (the valuation pillar is then honestly absent and the coverage gate reflects
+    it), rather than the previous constant earnings yield which made ERP a mere
+    sign-flipped duplicate of the 10Y rate.
     """
-    # Simple approx using DGS10 plus SPX return 5y realized — crude but keeps series alive.
+    pe = sp500_pe_ratio()
     ten = fred_dgs10()
-    spx_px = spx()
-    if ten.empty or spx_px.empty:
+    if pe.empty or ten.empty:
         return pd.Series(dtype=float, name="erp")
-    # Use rolling earnings-yield proxy: 1/(trailing 5y avg P/E proxy ~ price/rolling 5y mean price * 20)
-    # Cleaner path: Damodaran ERP (monthly). For live daily: crude 1/fwd_pe ~ 0.045 static.
-    # We'll use a reasonable earnings yield estimate = 1/22 (typical SPX fwd P/E ~ 20-24)
-    ey = pd.Series(100.0 / 22.0, index=spx_px.index)  # ~4.5%
-    ten_aligned = ten.reindex(spx_px.index).ffill()
-    erp = ey - ten_aligned
+    ey = 100.0 / pe  # earnings yield in percent
+    ey_daily = ey.sort_index().reindex(ten.index, method="ffill")
+    erp = (ey_daily - ten).dropna()
     erp.name = "erp"
-    return erp.dropna()
+    return erp
 
 
 # ---------------------------------------------------------------------------

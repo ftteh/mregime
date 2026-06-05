@@ -45,6 +45,21 @@ class IndicatorSpec:
     direction: Direction
     description: str
     weight: float = 1.0
+    # Optional pre-percentile transform. Trending / non-stationary macro series
+    # (net liquidity, DXY, real yields, copper/gold) saturate a raw rolling
+    # percentile at 0/100 for months; a rolling z-score re-centres them on their
+    # own recent regime so the percentile measures deviation, not level/drift.
+    #   None      -> rank the raw level (default; mean-reverting series)
+    #   "zscore"  -> rank a rolling z-score over `transform_window`
+    transform: str | None = None
+    transform_window: int = 252
+
+
+# Minimum observations an indicator must have before its percentile score is
+# trusted. Thin-history feeds (a 2-point GEX cache, a fresh put/call snapshot)
+# otherwise score 0/100 and masquerade as real extremes in the composite and
+# the high-conviction cluster override.
+MIN_OBS = 60
 
 
 INDICATORS: list[IndicatorSpec] = [
@@ -62,17 +77,17 @@ INDICATORS: list[IndicatorSpec] = [
         description="ICE BofA US Corporate OAS. Wide = credit stress = bottom. Tight = complacency = top.",
     ),
     IndicatorSpec(
-        key="move_index", label="MOVE Index (Bond Vol)",
-        bucket="credit_liquidity", source="yfinance:^MOVE / proxy",
+        key="move_index", label="Bond Vol (TLT realized-vol proxy)",
+        bucket="credit_liquidity", source="yfinance:TLT realized vol (MOVE proxy)",
         direction="contrarian_high_is_top",
-        description="Bond market volatility. High MOVE = liquidity stress = bottom setup (mirrors VIX).",
+        description="Bond-market volatility proxied by TLT 20d realized vol (true MOVE implied-vol index is not free on yfinance). High = liquidity stress = bottom setup (mirrors VIX).",
     ),
     IndicatorSpec(
         key="net_liquidity", label="Fed Net Liquidity (WALCL - TGA - RRP)",
         bucket="credit_liquidity", source="FRED:WALCL/WTREGEN/RRPONTSYD",
         direction="risk_high_is_top",
-        description="Systemic USD liquidity. Abundant liquidity fuels euphoric tops (Dec 2021 peak); drained liquidity = bottom regime.",
-        weight=1.0,
+        description="Systemic USD liquidity, z-scored vs its own 1y regime (it trends secularly with QE/QT, so the raw level pins the percentile). Rising vs trend = liquidity tailwind for tops; draining = bottom regime.",
+        weight=1.0, transform="zscore",
     ),
     IndicatorSpec(
         key="financial_conditions", label="Financial Conditions (NFCI)",
@@ -130,25 +145,29 @@ INDICATORS: list[IndicatorSpec] = [
         key="put_call", label="CBOE Equity Put/Call Ratio",
         bucket="sentiment_positioning", source="CBOE/YCharts",
         direction="contrarian_high_is_top",
-        description="Options hedging demand. Spikes = panic bottom, <0.5 = complacency top. INVERTED.",
+        description="Options hedging demand. Spikes = panic bottom, <0.5 = complacency top. INVERTED. Down-weighted: shares the put/call theme with the index ratio.",
+        weight=0.5,
     ),
     IndicatorSpec(
         key="vix", label="VIX",
         bucket="sentiment_positioning", source="yfinance:^VIX",
         direction="contrarian_high_is_top",
-        description="Equity vol. <13 = complacency top risk. >35 = panic bottom setup. INVERTED.",
+        description="Equity vol. <13 = complacency top risk. >35 = panic bottom setup. INVERTED. Down-weighted: anchor of the collinear vol complex (VIX/VVIX/SKEW/term-structure).",
+        weight=0.4,
     ),
     IndicatorSpec(
         key="vvix", label="VVIX (Vol of Vol)",
         bucket="sentiment_positioning", source="yfinance:^VVIX",
         direction="contrarian_high_is_top",
-        description="Hedge demand on VIX itself. Spike = serious tail hedging.",
+        description="Hedge demand on VIX itself. Spike = serious tail hedging. Down-weighted: collinear with the VIX complex.",
+        weight=0.4,
     ),
     IndicatorSpec(
         key="skew", label="CBOE SKEW",
         bucket="sentiment_positioning", source="yfinance:^SKEW",
         direction="risk_high_is_top",
-        description="Crash hedge demand by institutions. High SKEW = smart money hedging tail.",
+        description="Crash hedge demand by institutions. High SKEW = smart money hedging tail. Down-weighted: collinear with the VIX complex.",
+        weight=0.4,
     ),
 
     # 4. Valuation (10%)
@@ -177,13 +196,15 @@ INDICATORS: list[IndicatorSpec] = [
         key="vix_term_9d_1m", label="VIX9D / VIX (9D vs 1M term)",
         bucket="sentiment_positioning", source="yfinance:^VIX9D / ^VIX",
         direction="contrarian_high_is_top",
-        description="Ratio > 1 = near-term backwardation = acute panic = bottom within ~3 days historically.",
+        description="Ratio > 1 = near-term backwardation = acute panic = bottom within ~3 days historically. Down-weighted: collinear with the VIX complex.",
+        weight=0.4,
     ),
     IndicatorSpec(
         key="vix_term_1m_3m", label="VIX / VIX3M (1M vs 3M term)",
         bucket="sentiment_positioning", source="yfinance:^VIX / ^VIX3M",
         direction="contrarian_high_is_top",
-        description="Ratio > 1 = full term backwardation = serious stress = bottom regime.",
+        description="Ratio > 1 = full term backwardation = serious stress = bottom regime. Down-weighted: collinear with the VIX complex.",
+        weight=0.4,
     ),
 
     # 7. Yield curve (credit & liquidity pillar)
@@ -219,19 +240,22 @@ INDICATORS: list[IndicatorSpec] = [
         key="dxy", label="US Dollar Index (DXY)",
         bucket="credit_liquidity", source="yfinance:DX-Y.NYB",
         direction="contrarian_high_is_top",
-        description="High DXY = risk-off / liquidity drain / tight financial conditions = bottom regime. Low DXY = loose conditions = supportive of risk-asset tops.",
+        description="US dollar, z-scored vs its own 1y regime (the level trends). High vs trend = risk-off / liquidity drain = bottom regime; low = loose conditions supportive of tops.",
+        transform="zscore",
     ),
     IndicatorSpec(
         key="real_yield_10y", label="10Y TIPS Real Yield",
         bucket="credit_liquidity", source="FRED:DFII10",
         direction="contrarian_high_is_top",
-        description="High real yields = tight discount rate = equity pressure = bottom regime (2022 drawdown). Low/negative = cheap money = euphoric top fuel (2021).",
+        description="10Y real yield, z-scored vs its own 1y regime (it regime-shifted from -1% in 2021 to +2% in 2023). High vs trend = tight discount rate = equity pressure = bottom; low = cheap money = top fuel.",
+        transform="zscore",
     ),
     IndicatorSpec(
         key="copper_gold", label="Copper / Gold Ratio",
         bucket="credit_liquidity", source="yfinance:HG=F / GC=F",
         direction="risk_high_is_top",
-        description="Global growth proxy. High ratio = growth strong / risk-on euphoria (top risk). Low ratio = growth fears / risk-off (bottom). Leads HY spreads by 1-2 months.",
+        description="Global growth proxy, z-scored vs its own 1y regime. High vs trend = growth/risk-on euphoria (top); low = growth fears / risk-off (bottom). Leads HY spreads by 1-2 months.",
+        transform="zscore",
     ),
 
     # 10. Interbank Funding Stress (Repo Market / FRA-OIS)
@@ -253,13 +277,15 @@ INDICATORS: list[IndicatorSpec] = [
         key="gamma_exposure", label="Gamma Exposure (GEX) Proxy",
         bucket="sentiment_positioning", source="CBOE delayed SPY options",
         direction="risk_high_is_top",
-        description="Estimated dealer gamma exposure from SPY options. Deep negative GEX = market makers forced to sell into weakness (crash accelerant). Extreme negative = capitulation = bottom. Positive = stability.",
+        description="Estimated dealer gamma exposure from SPY options. Deep negative GEX = market makers forced to sell into weakness (crash accelerant). Extreme negative = capitulation = bottom. Positive = stability. Down-weighted: shares the gamma theme with the flip-zone metric.",
+        weight=0.5,
     ),
     IndicatorSpec(
         key="gamma_flip_zone", label="Gamma Flip Zone Distance (%)",
         bucket="sentiment_positioning", source="CBOE delayed SPY options / GEX proxy",
         direction="contrarian_high_is_top",
-        description="Distance to 'zero gamma' price where dealer hedging flips from buy-to-sell to sell-to-buy. Near/past flip = volatility expansion = bottom risk.",
+        description="Distance to 'zero gamma' price where dealer hedging flips from buy-to-sell to sell-to-buy. Near/past flip = volatility expansion = bottom risk. Down-weighted: shares the gamma theme with GEX.",
+        weight=0.5,
     ),
 
     # 12. Enhanced Institutional Positioning
@@ -267,11 +293,43 @@ INDICATORS: list[IndicatorSpec] = [
         key="index_put_call", label="Index Put/Call Ratio (Institutional Hedging)",
         bucket="sentiment_positioning", source="CBOE/YCharts",
         direction="contrarian_high_is_top",
-        description="Institutions hedge portfolios with index puts (not equity puts). Spike = panic hedging by smart money. Extreme spike then rapid drop = hedges monetized = bottom.",
+        description="Institutions hedge portfolios with index puts (not equity puts). Spike = panic hedging by smart money. Extreme spike then rapid drop = hedges monetized = bottom. Down-weighted: shares the put/call theme with the equity ratio.",
+        weight=0.5,
     ),
 ]
 
 INDICATORS_BY_KEY = {i.key: i for i in INDICATORS}
+
+
+# Collinearity themes for cluster de-duplication. The cluster signal counts
+# independent *themes* at an extreme, not raw indicators — otherwise a single
+# vol event lights up VIX/VVIX/SKEW/term-structure simultaneously and fakes a
+# "4+ aligned extremes" confluence from one underlying factor. Indicators not
+# listed here are their own theme (keyed by their own name).
+INDICATOR_THEMES: dict[str, str] = {
+    "vix": "vol_complex",
+    "vvix": "vol_complex",
+    "skew": "vol_complex",
+    "vix_term_9d_1m": "vol_complex",
+    "vix_term_1m_3m": "vol_complex",
+    "gamma_exposure": "gamma",
+    "gamma_flip_zone": "gamma",
+    "put_call": "put_call",
+    "index_put_call": "put_call",
+    "curve_2s10s": "yield_curve",
+    "curve_3m10y": "yield_curve",
+    "curve_resteep_2s10s": "yield_curve",
+    "hy_spread": "credit_spread",
+    "ig_spread": "credit_spread",
+    "hy_spread_velocity": "credit_spread",
+    "fra_ois_spread": "funding_stress",
+    "sofr_spread": "funding_stress",
+}
+
+
+def theme_for(key: str) -> str:
+    """Return the collinearity theme for an indicator key (defaults to itself)."""
+    return INDICATOR_THEMES.get(key, key)
 
 
 REGIME_THRESHOLDS = {
