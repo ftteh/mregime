@@ -23,22 +23,19 @@ log = logging.getLogger(__name__)
 # Normalization
 # ---------------------------------------------------------------------------
 def rolling_percentile(s: pd.Series, window: int = ROLLING_WINDOW_DAYS) -> pd.Series:
-    """Return rolling percentile rank (0-100) of s over `window` observations."""
+    """Return rolling percentile rank (0-100) of s over `window` observations.
+
+    Equivalent to ranking the current observation against the trailing window via
+    ``(x <= x[-1]).mean() * 100``. Implemented with the vectorized C-level
+    ``Rolling.rank`` (method="max" counts ties as values <= current, matching the
+    ``<=`` comparison) instead of a Python-level apply — same result, ~10x faster.
+    """
     if s is None or s.empty:
         return pd.Series(dtype=float)
     win = min(window, max(30, len(s) // 2 if len(s) > 60 else len(s)))
-
-    def _last_rank_pct(x: np.ndarray) -> float:
-        x = x[~np.isnan(x)]
-        if x.size == 0:
-            return np.nan
-        return float((x <= x[-1]).mean() * 100.0)
-
-    r = s.rolling(win, min_periods=max(30, win // 4)).apply(
-        _last_rank_pct,
-        raw=True,
-    )
-    return r
+    return s.rolling(win, min_periods=max(30, win // 4)).rank(
+        pct=True, method="max"
+    ) * 100.0
 
 
 def latest_percentile(s: pd.Series, window: int = ROLLING_WINDOW_DAYS) -> float:
@@ -132,23 +129,18 @@ def _fetch_parallel(tasks: dict[str, Callable[[], pd.Series]]) -> Dict[str, pd.S
 
 
 def _ad_line_proxy() -> pd.Series:
-    """A/D line proxy: sign of daily returns across a liquid S&P sample."""
+    """A/D line proxy: sign of daily returns across a liquid S&P sample.
+
+    Reuses the shared S&P close panel (top 100, last ~1y) instead of issuing its
+    own bulk download. The 1-year tail reproduces the original period="1y" input
+    to the cumulative advance-decline calculation.
+    """
     try:
-        tickers = D.sp500_tickers()[:100]
-        import yfinance as yf
-        dl = yf.download(
-            tickers,
-            period="1y",
-            progress=False,
-            auto_adjust=False,
-            group_by="ticker",
-            threads=True,
-        )
-        rets = pd.DataFrame({
-            t: dl[t]["Close"].pct_change()
-            for t in tickers
-            if t in dl.columns.get_level_values(0)
-        })
+        panel, wanted = D._panel_columns(100)
+        if not wanted:
+            return _empty_series("ad_line_slope")
+        closes = panel[wanted].tail(252)  # ~1 trading year
+        rets = closes.pct_change()
         ad = (rets > 0).sum(axis=1) - (rets < 0).sum(axis=1)
         ad.name = "ad_line_slope"
         return ad.cumsum()
@@ -169,6 +161,11 @@ def _aaii_bull_bear_spread() -> pd.Series:
 def build_raw() -> RawFrame:
     s: Dict[str, pd.Series] = {}
     meta: Dict[str, dict] = {}
+
+    # Fresh build → drop any memoized fetch results from a prior build so shared
+    # sources (^VIX, S&P close panel, GEX proxy, …) are fetched once per build
+    # but still refreshed live on the next cache miss / "Refresh data".
+    D.reset_fetch_memo()
 
     tasks: dict[str, Callable[[], pd.Series]] = {
         # ---- Credit & Liquidity
@@ -367,9 +364,15 @@ def historical_pillar_scores(raw: RawFrame) -> pd.DataFrame:
     return pd.DataFrame(buckets)
 
 
-def historical_composite(raw: RawFrame) -> pd.Series:
-    """Rolling 0-100 composite regime score over time (weighted pillar average)."""
-    pillars = historical_pillar_scores(raw)
+def historical_composite(raw: RawFrame, pillars: pd.DataFrame | None = None) -> pd.Series:
+    """Rolling 0-100 composite regime score over time (weighted pillar average).
+
+    Accepts an optional precomputed `pillars` frame (from historical_pillar_scores)
+    so callers that also need pillar momentum don't pay for the rolling-percentile
+    pass twice.
+    """
+    if pillars is None:
+        pillars = historical_pillar_scores(raw)
     if pillars.empty:
         return pd.Series(dtype=float, name="composite")
     w = pd.Series(BUCKET_WEIGHTS).reindex(pillars.columns).fillna(0.0)
@@ -485,13 +488,18 @@ def exposure_recommendation(
     }
 
 
-def pillar_momentum(raw: RawFrame) -> dict:
+def pillar_momentum(raw: RawFrame, pillars: pd.DataFrame | None = None) -> dict:
     """
     Rate-of-change per pillar: today score, 1 week ago, 1 month ago.
     Returns dict of pillar -> {today, 1w, 1m, d_1w, d_1m} where d_1w / d_1m are
     the change (today - prior). Positive delta = moving toward top-risk/complacency.
+
+    Accepts an optional precomputed `pillars` frame so it can share the
+    rolling-percentile pass with historical_composite().
     """
-    hist = historical_pillar_scores(raw).dropna(how="all")
+    if pillars is None:
+        pillars = historical_pillar_scores(raw)
+    hist = pillars.dropna(how="all")
     if hist.empty:
         return {}
     hist = hist.ffill()

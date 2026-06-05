@@ -6,12 +6,14 @@ so the dashboard keeps working even if one source is down.
 
 from __future__ import annotations
 import contextlib
+import functools
 import io
 import json
 import logging
 import os
 import re
 import sys
+import threading
 from datetime import datetime, timedelta
 from functools import lru_cache
 
@@ -62,6 +64,64 @@ UA = {
 
 
 # ---------------------------------------------------------------------------
+# Per-build fetch memoization
+# ---------------------------------------------------------------------------
+# Several building-block fetchers are consumed by more than one indicator in a
+# single dashboard build: ^VIX feeds the VIX tile plus three term/divergence
+# series; the S&P close panel feeds breadth, new-highs and the A/D proxy; the
+# (expensive) gamma-exposure proxy feeds both GEX and the flip-zone history.
+# Without memoization each is re-fetched on every call, multiplying network and
+# CPU cost on the cold path.
+#
+# The cache is scoped to a single build: `reset_fetch_memo()` is called at the
+# top of build_raw(), so each fresh build (cache miss / "Refresh data") still
+# re-fetches live, while concurrent consumers within one build share one result.
+_FETCH_MEMO: dict[str, object] = {}
+_FETCH_MEMO_LOCKS: dict[str, threading.Lock] = {}
+_FETCH_MEMO_GUARD = threading.Lock()
+_MEMO_MISSING = object()  # sentinel: distinguishes "absent" from a cached None/NaN
+
+
+def reset_fetch_memo() -> None:
+    """Drop all memoized fetch results. Call once at the start of a build."""
+    with _FETCH_MEMO_GUARD:
+        _FETCH_MEMO.clear()
+        _FETCH_MEMO_LOCKS.clear()
+
+
+def _memoized_fetch(fn):
+    """Memoize a zero-argument fetcher for the lifetime of one build.
+
+    Only no-arg calls are memoized (all decorated fetchers use their defaults);
+    any call passing arguments bypasses the cache. A per-key lock prevents two
+    threads from racing to compute the same source while still letting distinct
+    sources fetch concurrently.
+    """
+    key = fn.__qualname__
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        if args or kwargs:
+            return fn(*args, **kwargs)
+        # Single-read fast path: .get() is atomic, so a concurrent
+        # reset_fetch_memo() can only make us miss into the locked slow path —
+        # never raise KeyError on a key that was cleared between check and read.
+        cached = _FETCH_MEMO.get(key, _MEMO_MISSING)
+        if cached is not _MEMO_MISSING:
+            return cached
+        with _FETCH_MEMO_GUARD:
+            lock = _FETCH_MEMO_LOCKS.setdefault(key, threading.Lock())
+        with lock:
+            cached = _FETCH_MEMO.get(key, _MEMO_MISSING)
+            if cached is _MEMO_MISSING:
+                cached = fn()
+                _FETCH_MEMO[key] = cached
+            return cached
+
+    return wrapper
+
+
+# ---------------------------------------------------------------------------
 # FRED
 # ---------------------------------------------------------------------------
 def _fred(series_id: str, start: str = "2015-01-01") -> pd.Series:
@@ -107,6 +167,7 @@ def _fred(series_id: str, start: str = "2015-01-01") -> pd.Series:
     return pd.Series(dtype=float, name=series_id)
 
 
+@_memoized_fetch
 def fred_hy_spread() -> pd.Series:
     return _fred("BAMLH0A0HYM2")
 
@@ -182,6 +243,7 @@ def yf_series(ticker: str, period: str = "5y", field: str = "Close") -> pd.Serie
         return pd.Series(dtype=float, name=ticker)
 
 
+@_memoized_fetch
 def vix() -> pd.Series:
     return yf_series("^VIX")
 
@@ -194,6 +256,7 @@ def skew() -> pd.Series:
     return yf_series("^SKEW")
 
 
+@_memoized_fetch
 def spx() -> pd.Series:
     return yf_series("^GSPC")
 
@@ -247,6 +310,7 @@ def vix_term_1m_3m() -> pd.Series:
     return s
 
 
+@_memoized_fetch
 def move_index() -> pd.Series:
     """
     MOVE index is not directly on yfinance. We proxy with realized vol of TLT
@@ -306,15 +370,21 @@ def sp500_tickers() -> list[str]:
     ]
 
 
-def breadth_pct_above_200dma(sample_size: int = 120) -> pd.Series:
+@_memoized_fetch
+def _sp500_close_panel() -> pd.DataFrame:
     """
-    Compute % of a sample of SP500 above their 200-day MA over time.
-    Returns a daily series.
+    Download daily closes for the largest S&P names once and share the result.
 
-    We use a sample (default 120 largest) for speed; correlation with full-index
-    breadth is >0.97 empirically.
+    breadth_pct_above_200dma (120), new_highs_minus_lows (150) and the A/D-line
+    proxy (100) all operate on the top-N most liquid constituents over a 2y
+    window. Fetching the 150-name / 2y superset a single time and slicing it by
+    ticker name lets every consumer reuse one bulk download instead of issuing
+    three overlapping ones — the dominant cold-load network cost.
+
+    Columns are constituent tickers (insertion-ordered to match sp500_tickers);
+    the index is tz-naive daily. Returns an empty frame if the download fails.
     """
-    tickers = sp500_tickers()[:sample_size]
+    tickers = sp500_tickers()[:150]
     try:
         with _silence_stderr():
             df = yf.download(
@@ -326,8 +396,8 @@ def breadth_pct_above_200dma(sample_size: int = 120) -> pd.Series:
                 threads=True,
             )
     except Exception as e:
-        log.error("yf.download breadth failed: %s", e)
-        return pd.Series(dtype=float, name="pct_above_200dma")
+        log.error("yf.download S&P panel failed: %s", e)
+        return pd.DataFrame()
 
     closes = {}
     for t in tickers:
@@ -336,9 +406,41 @@ def breadth_pct_above_200dma(sample_size: int = 120) -> pd.Series:
         except Exception:
             continue
     if not closes:
+        return pd.DataFrame()
+
+    panel = pd.DataFrame(closes)
+    if getattr(panel.index, "tz", None) is not None:
+        panel.index = panel.index.tz_localize(None)
+    return panel
+
+
+def _panel_columns(sample_size: int) -> tuple[pd.DataFrame, list[str]]:
+    """Return the shared close panel and the present top-`sample_size` tickers.
+
+    Selecting by ticker name (not positional slice) reproduces the original
+    per-function behavior, which iterated `tickers[:sample_size]` and kept only
+    those that downloaded successfully.
+    """
+    panel = _sp500_close_panel()
+    if panel.empty:
+        return panel, []
+    wanted = [t for t in sp500_tickers()[:sample_size] if t in panel.columns]
+    return panel, wanted
+
+
+def breadth_pct_above_200dma(sample_size: int = 120) -> pd.Series:
+    """
+    Compute % of a sample of SP500 above their 200-day MA over time.
+    Returns a daily series.
+
+    We use a sample (default 120 largest) for speed; correlation with full-index
+    breadth is >0.97 empirically.
+    """
+    panel, wanted = _panel_columns(sample_size)
+    if not wanted:
         return pd.Series(dtype=float, name="pct_above_200dma")
 
-    close_df = pd.DataFrame(closes).ffill()
+    close_df = panel[wanted].ffill()
     ma200 = close_df.rolling(200).mean()
     above = (close_df > ma200).sum(axis=1)
     valid = (close_df.notna() & ma200.notna()).sum(axis=1)
@@ -350,25 +452,10 @@ def breadth_pct_above_200dma(sample_size: int = 120) -> pd.Series:
 
 def new_highs_minus_lows(sample_size: int = 150) -> pd.Series:
     """52-week new highs minus new lows among a sample of SP500."""
-    tickers = sp500_tickers()[:sample_size]
-    try:
-        with _silence_stderr():
-            df = yf.download(
-                tickers, period="2y", auto_adjust=False, progress=False,
-                group_by="ticker", threads=True,
-            )
-    except Exception:
+    panel, wanted = _panel_columns(sample_size)
+    if not wanted:
         return pd.Series(dtype=float, name="new_highs_minus_lows")
-
-    closes = {}
-    for t in tickers:
-        try:
-            closes[t] = df[t]["Close"]
-        except Exception:
-            continue
-    if not closes:
-        return pd.Series(dtype=float, name="new_highs_minus_lows")
-    cdf = pd.DataFrame(closes).ffill()
+    cdf = panel[wanted].ffill()
     hi = cdf.rolling(252).max()
     lo = cdf.rolling(252).min()
     new_hi = (cdf >= hi).sum(axis=1)
@@ -977,6 +1064,7 @@ def move_vs_vix_spread() -> pd.Series:
     return ratio
 
 
+@_memoized_fetch
 def _squeezemetrics_csv() -> pd.DataFrame:
     """
     Fetch the SqueezeMetrics public CSV. Returns DataFrame with date index
@@ -1123,6 +1211,7 @@ def cftc_cta_positioning() -> pd.Series:
 # ---------------------------------------------------------------------------
 # Yield curve
 # ---------------------------------------------------------------------------
+@_memoized_fetch
 def curve_2s10s() -> pd.Series:
     """10Y - 2Y Treasury yield spread (FRED T10Y2Y). Negative = inverted."""
     s = _fred("T10Y2Y")
@@ -1330,6 +1419,7 @@ def _gex_implied_gamma_flip_history(gex: pd.Series) -> pd.Series:
     return proxy.dropna()
 
 
+@_memoized_fetch
 def gamma_exposure_proxy() -> pd.Series:
     """
     Gamma Exposure (GEX) — estimated dealer gamma.

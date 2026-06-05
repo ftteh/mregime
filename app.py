@@ -54,6 +54,7 @@ from src.indicators import (
     composite,
     exposure_recommendation,
     historical_composite,
+    historical_pillar_scores,
     latest_percentile,
     orient_score,
     pillar_momentum,
@@ -113,8 +114,12 @@ def load_all():
     scores = score_indicators(raw)
     comp = composite(scores)
     cluster = cluster_signal(scores)
-    momentum = pillar_momentum(raw)
-    comp_hist = historical_composite(raw)
+    # historical_pillar_scores runs the rolling-percentile pass for every
+    # indicator — the heaviest CPU step. Compute it once and feed both
+    # consumers instead of paying for it twice.
+    pillars = historical_pillar_scores(raw)
+    momentum = pillar_momentum(raw, pillars=pillars)
+    comp_hist = historical_composite(raw, pillars=pillars)
     return raw, scores, comp, cluster, momentum, comp_hist
 
 
