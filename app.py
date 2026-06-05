@@ -303,11 +303,10 @@ def _line(
         st.info(f"{title}: no data in last {CHART_LOOKBACK_YEARS} years")
         return
     score_color = _top_risk_to_line_color(score if not np.isnan(score) else None)
-    # The series is drawn in a neutral tone: a single scalar (today's score) can't
-    # honestly colour the whole history. Only the CURRENT point carries the
-    # top-risk colour, so the chart shows where the indicator *is now* without
-    # implying the past was that risky.
+    # Line carries the live top-risk colour (green→red) so the wall of charts
+    # reads at a glance; indicators without a score fall back to neutral grey.
     NEUTRAL = "rgb(154,164,173)"
+    line_color = score_color if not np.isnan(score) else NEUTRAL
     fig = go.Figure()
     # If the series has only 1-2 points (common for cached daily snapshots like GEX),
     # `mode="lines"` renders nearly invisible. Add markers so "fresh" indicators
@@ -318,10 +317,10 @@ def _line(
             x=plot_s.index,
             y=plot_s.values,
             mode=mode,
-            line=dict(width=2.2, color=NEUTRAL),
-            marker=dict(size=6, color=NEUTRAL, line=dict(color="rgba(0,0,0,0)", width=0)),
+            line=dict(width=2.2, color=line_color),
+            marker=dict(size=6, color=line_color, line=dict(color="rgba(0,0,0,0)", width=0)),
             fill="tozeroy",
-            fillcolor=_rgb_to_rgba(NEUTRAL, 0.10),
+            fillcolor=_rgb_to_rgba(line_color, 0.10),
             name=title,
         )
     )
@@ -997,7 +996,14 @@ def _render_index_regime_overlay(
         "green bands before rallies."
     )
     if price_full is None or price_full.empty or comp_hist is None or comp_hist.empty:
-        st.info("Not enough history yet to render regime bands.")
+        # Name the failing leg so a broken data source on the host is
+        # diagnosable from the page itself (e.g. Yahoo rate-limiting cloud IPs).
+        why = []
+        if price_full is None or price_full.empty:
+            why.append("index price feed returned no data")
+        if comp_hist is None or comp_hist.empty:
+            why.append("composite history is empty — no indicator passed the min-history gate")
+        st.info(f"Not enough history yet to render regime bands ({'; '.join(why)}).")
         return
 
     price_plot = _clip_series_to_chart_window(price_full)

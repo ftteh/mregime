@@ -14,6 +14,7 @@ import os
 import re
 import sys
 import threading
+import time
 from datetime import datetime, timedelta
 from functools import lru_cache
 
@@ -228,37 +229,85 @@ def fred_dgs10() -> pd.Series:
 # ---------------------------------------------------------------------------
 # yfinance (prices, vol indices)
 # ---------------------------------------------------------------------------
+# Yahoo rate-limits burst traffic hard on shared-IP hosts (Streamlit Cloud).
+# build_raw fans ~15 yf calls out in parallel; gate them so only a couple hit
+# Yahoo at once, and retry once after a short backoff — 429s are bursty.
+_YF_GATE = threading.Semaphore(2)
+
+
 def yf_series(ticker: str, period: str = "5y", field: str = "Close") -> pd.Series:
+    for attempt in (1, 2):
+        try:
+            with _YF_GATE:
+                with _silence_stderr():
+                    df = yf.Ticker(ticker).history(period=period, auto_adjust=False)
+            if not df.empty:
+                s = df[field].copy()
+                s.index = s.index.tz_localize(None) if s.index.tz is not None else s.index
+                s.name = ticker
+                return s.dropna()
+        except Exception as e:
+            log.info("yfinance unavailable for %s (%s)", ticker, str(e)[:80])
+        if attempt == 1:
+            time.sleep(1.5)
+    return pd.Series(dtype=float, name=ticker)
+
+
+def _cboe_index_history(symbol: str) -> pd.Series:
+    """
+    Official CBOE daily index history CSV (full archive since inception, no
+    key). Fallback for the vol complex when Yahoo rate-limits shared-IP hosts.
+    OHLC files (VIX/VIX9D/VIX3M) use the CLOSE column; single-value files
+    (VVIX/SKEW) use their value column.
+    """
+    url = f"https://cdn.cboe.com/api/global/us_indices/daily_prices/{symbol}_History.csv"
     try:
-        with _silence_stderr():
-            df = yf.Ticker(ticker).history(period=period, auto_adjust=False)
-        if df.empty:
-            return pd.Series(dtype=float, name=ticker)
-        s = df[field].copy()
-        s.index = s.index.tz_localize(None) if s.index.tz is not None else s.index
-        s.name = ticker
-        return s.dropna()
+        r = requests.get(url, headers=UA, timeout=15)
+        if not r.ok:
+            return pd.Series(dtype=float, name=symbol)
+        df = pd.read_csv(io.StringIO(r.text))
+        df.columns = [str(c).strip().upper() for c in df.columns]
+        if "DATE" not in df.columns:
+            return pd.Series(dtype=float, name=symbol)
+        col = "CLOSE" if "CLOSE" in df.columns else df.columns[-1]
+        s = pd.Series(
+            pd.to_numeric(df[col], errors="coerce").values,
+            index=pd.to_datetime(df["DATE"], errors="coerce"),
+            name=symbol,
+        )
+        s = s[s.index.notna()].dropna().sort_index()
+        return s
     except Exception as e:
-        log.info("yfinance unavailable for %s (%s)", ticker, str(e)[:80])
-        return pd.Series(dtype=float, name=ticker)
+        log.info("CBOE history unavailable for %s (%s)", symbol, str(e)[:60])
+        return pd.Series(dtype=float, name=symbol)
 
 
 @_memoized_fetch
 def vix() -> pd.Series:
-    return yf_series("^VIX")
+    s = yf_series("^VIX")
+    return s if not s.empty else _cboe_index_history("VIX")
 
 
 def vvix() -> pd.Series:
-    return yf_series("^VVIX")
+    s = yf_series("^VVIX")
+    return s if not s.empty else _cboe_index_history("VVIX")
 
 
 def skew() -> pd.Series:
-    return yf_series("^SKEW")
+    s = yf_series("^SKEW")
+    return s if not s.empty else _cboe_index_history("SKEW")
 
 
 @_memoized_fetch
 def spx() -> pd.Series:
-    return yf_series("^GSPC")
+    s = yf_series("^GSPC")
+    if not s.empty:
+        return s
+    # FRED carries the S&P 500 daily close (trailing ~10y) — enough for the
+    # regime-band chart, RSI and percentile scoring when Yahoo is blocked.
+    fb = _fred("SP500")
+    fb.name = "^GSPC"
+    return fb
 
 
 def russell2000() -> pd.Series:
@@ -268,17 +317,24 @@ def russell2000() -> pd.Series:
 
 def nasdaq_composite() -> pd.Series:
     """Nasdaq Composite index (^IXIC)."""
-    return yf_series("^IXIC")
+    s = yf_series("^IXIC")
+    if not s.empty:
+        return s
+    fb = _fred("NASDAQCOM")
+    fb.name = "^IXIC"
+    return fb
 
 
 def vix9d() -> pd.Series:
     """CBOE 9-day volatility index. Not on yfinance for all ranges; falls back empty."""
-    return yf_series("^VIX9D")
+    s = yf_series("^VIX9D")
+    return s if not s.empty else _cboe_index_history("VIX9D")
 
 
 def vix3m() -> pd.Series:
     """CBOE 3-month volatility index."""
-    return yf_series("^VIX3M")
+    s = yf_series("^VIX3M")
+    return s if not s.empty else _cboe_index_history("VIX3M")
 
 
 def vix_term_9d_1m() -> pd.Series:
