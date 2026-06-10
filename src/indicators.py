@@ -7,7 +7,8 @@ from __future__ import annotations
 import logging
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from datetime import datetime
+from dataclasses import dataclass, field
 from typing import Callable, Dict
 
 import numpy as np
@@ -81,7 +82,10 @@ def apply_transform(s: pd.Series, transform: str | None, window: int = 252) -> p
     mean = s.rolling(win, min_periods=max(30, win // 4)).mean()
     std = s.rolling(win, min_periods=max(30, win // 4)).std()
     z = (s - mean) / std.replace(0, np.nan)
-    return z.dropna()
+    # Keep NaNs (warm-up window, zero-std stretches) instead of deleting rows:
+    # dropping them silently shifted rolling-percentile window membership and
+    # could report a stale earlier row as the "current" value.
+    return z
 
 
 # ---------------------------------------------------------------------------
@@ -111,6 +115,10 @@ def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
 class RawFrame:
     series: Dict[str, pd.Series]
     meta: Dict[str, dict]
+    # Display-only context series (synthetic backfills, legacy mixed-method
+    # cache rows). Charts may render them visibly distinct; they never enter
+    # scoring/MIN_OBS/cluster. Default keeps 2-arg construction (tests) valid.
+    display: Dict[str, pd.Series] = field(default_factory=dict)
 
 
 def _empty_series(name: str = "") -> pd.Series:
@@ -161,11 +169,16 @@ def _ad_line_proxy() -> pd.Series:
     try:
         panel, wanted = D._panel_columns(100)
         if not wanted:
+            D.record_provenance("ad_line_slope", "", kind="unavailable")
             return _empty_series("ad_line_slope")
         closes = panel[wanted].tail(252)  # ~1 trading year
         rets = closes.pct_change()
         ad = (rets > 0).sum(axis=1) - (rets < 0).sum(axis=1)
         ad.name = "ad_line_slope"
+        D.record_provenance(
+            "ad_line_slope", f"sp500_sample_panel(top {len(wanted)})", kind="computed",
+            note="A/D proxy from current-membership sample, not NYSE official",
+        )
         return ad.cumsum()
     except Exception as e:
         log.info("A/D line proxy failed: %s", str(e)[:120])
@@ -266,7 +279,14 @@ def build_raw() -> RawFrame:
                 "n": int(len(v)),
             }
 
-    return RawFrame(series=s, meta=meta)
+    # Which source ACTUALLY served each indicator this build (primary /
+    # fallback / proxy / cache / unavailable) — surfaced in the UI so degraded
+    # feeds can't masquerade as their configured source.
+    prov = D.get_provenance()
+    for k in s:
+        meta.setdefault(k, {})["provenance"] = prov.get(k)
+
+    return RawFrame(series=s, meta=meta, display=D.get_display_overlays())
 
 
 # ---------------------------------------------------------------------------
@@ -301,6 +321,7 @@ def score_indicators(raw: RawFrame, per_indicator: pd.DataFrame | None = None) -
         else:
             pct = score
 
+        prov = raw.meta.get(key, {}).get("provenance") or {}
         rows.append({
             "key": key,
             "label": spec.label,
@@ -313,6 +334,9 @@ def score_indicators(raw: RawFrame, per_indicator: pd.DataFrame | None = None) -
             "theme": theme_for(key),
             "as_of": raw.meta.get(key, {}).get("as_of"),
             "n_obs": n_obs,
+            "source_used": prov.get("source"),
+            "source_kind": prov.get("kind"),
+            "source_note": prov.get("note"),
         })
     return pd.DataFrame(rows)
 
@@ -668,3 +692,67 @@ def pillar_momentum(raw: RawFrame, pillars: pd.DataFrame | None = None) -> dict:
             "d_1m": (t - m) if not (np.isnan(t) or np.isnan(m)) else np.nan,
         }
     return out
+
+
+# ---------------------------------------------------------------------------
+# Decision-trust helpers (pure logic — UI renders the result)
+# ---------------------------------------------------------------------------
+def gauge_state(composite_score: float | None) -> dict:
+    """Render-state for the composite gauge: {'status': 'ok'|'offline', 'value'}.
+
+    A NaN composite must NEVER be drawn as 0.0 — on the 0-100 regime scale,
+    0 reads as 'capitulation / aggressive accumulation', the exact opposite of
+    'model offline'. The UI shows an explicit offline state instead.
+    """
+    if composite_score is None or (
+        isinstance(composite_score, (int, float)) and np.isnan(composite_score)
+    ):
+        return {"status": "offline", "value": None}
+    return {"status": "ok", "value": float(composite_score)}
+
+
+def read_confidence(
+    scores_df: pd.DataFrame, covered_weight: float, now: datetime | None = None
+) -> dict:
+    """How much to trust today's composite: model coverage, indicator agreement
+    (score dispersion) and data freshness. A precise composite number is only as
+    good as how much of the model is online, how aligned it is, and how stale
+    its inputs are.
+
+    `staleness` = age in days of the STALEST contributing feed (max gap), or
+    None when no contributing indicator carries an `as_of` timestamp. Unknown
+    freshness is treated as NOT fresh (confidence capped at Low) — it used to
+    pass the High-tier check, rating an unverifiable reading as trustworthy.
+    """
+    scored = scores_df.dropna(subset=["score"])
+    n_contrib, total = int(len(scored)), int(len(scores_df))
+    dispersion = float(scored["score"].std()) if len(scored) > 1 else np.nan
+    now = datetime.now() if now is None else now
+    ages = [
+        (now - pd.Timestamp(a).to_pydatetime().replace(tzinfo=None)).days
+        for a in scored["as_of"].tolist()
+        if a is not None
+    ]
+    staleness = max(ages) if ages else None
+    n_missing_asof = n_contrib - len(ages)
+
+    n_proxy = 0
+    if "source_kind" in scored.columns:
+        n_proxy = int(scored["source_kind"].isin(["proxy", "fallback"]).sum())
+
+    # Three-tier rating from the weakest dimension; unknown staleness = Low.
+    if staleness is None:
+        level, color = "Low", "#c0392b"
+    elif covered_weight >= 0.8 and staleness <= 10 and (np.isnan(dispersion) or dispersion <= 25):
+        level, color = "High", "#16a085"
+    elif covered_weight >= 0.6 and staleness <= 21:
+        level, color = "Medium", "#e67e22"
+    else:
+        level, color = "Low", "#c0392b"
+    return {
+        "level": level, "color": color,
+        "coverage_pct": covered_weight * 100.0,
+        "n_contrib": n_contrib, "total": total,
+        "dispersion": dispersion, "staleness": staleness,
+        "n_missing_asof": n_missing_asof, "n_proxy": n_proxy,
+    }

@@ -44,21 +44,21 @@ from src.config import (
     regime_label,
     DEFAULT_REGIME_COLORS,
     get_regime_color_for_score,
-    get_regime_step_config,
     get_regime_name_for_score,
-    get_regime_band_alpha,
 )
 from src.indicators import (
     build_raw,
     cluster_signal,
     composite,
     exposure_recommendation,
+    gauge_state,
     historical_composite,
     historical_pillar_scores,
     latest_percentile,
     per_indicator_history,
     orient_score,
     pillar_momentum,
+    read_confidence,
     score_indicators,
 )
 
@@ -293,13 +293,22 @@ def _line(
     indicator_key: str | None = None,
     extra_direction: str | None = None,
     marker_ts: pd.Timestamp | None = None,
+    display_overlay: pd.Series | None = None,
 ) -> None:
     if series is None or series.empty:
-        st.info(f"{title}: no data")
-        return
+        if display_overlay is not None and not display_overlay.empty:
+            series = pd.Series(dtype=float)  # render overlay-only chart below
+        else:
+            st.info(f"{title}: no data")
+            return
     score = _score_for_chart(indicator_key, series, extra_direction)
-    plot_s = _clip_series_to_chart_window(series)
-    if plot_s.empty:
+    plot_s = _clip_series_to_chart_window(series) if not series.empty else series
+    overlay_s = (
+        _clip_series_to_chart_window(display_overlay)
+        if display_overlay is not None and not display_overlay.empty
+        else None
+    )
+    if plot_s.empty and (overlay_s is None or overlay_s.empty):
         st.info(f"{title}: no data in last {CHART_LOOKBACK_YEARS} years")
         return
     score_color = _top_risk_to_line_color(score if not np.isnan(score) else None)
@@ -308,30 +317,44 @@ def _line(
     NEUTRAL = "rgb(154,164,173)"
     line_color = score_color if not np.isnan(score) else NEUTRAL
     fig = go.Figure()
-    # If the series has only 1-2 points (common for cached daily snapshots like GEX),
-    # `mode="lines"` renders nearly invisible. Add markers so "fresh" indicators
-    # show up immediately.
-    mode = "lines" if len(plot_s) >= 3 else "lines+markers"
-    fig.add_trace(
-        go.Scatter(
-            x=plot_s.index,
-            y=plot_s.values,
-            mode=mode,
-            line=dict(width=2.2, color=line_color),
-            marker=dict(size=6, color=line_color, line=dict(color="rgba(0,0,0,0)", width=0)),
-            fill="tozeroy",
-            fillcolor=_rgb_to_rgba(line_color, 0.10),
-            name=title,
+    # Synthetic/legacy backfill behind the measured data, visibly distinct.
+    if overlay_s is not None and not overlay_s.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=overlay_s.index,
+                y=overlay_s.values,
+                mode="lines",
+                line=dict(width=1.4, color="rgba(154,164,173,0.55)", dash="dot"),
+                name="synthetic/legacy backfill (display only)",
+                showlegend=True,
+                hovertemplate="backfill (not scored) %{x|%Y-%m-%d}: %{y:.4g}<extra></extra>",
+            )
         )
-    )
+    if not plot_s.empty:
+        # If the series has only 1-2 points (common for freshly rebuilt measured
+        # histories like GEX), `mode="lines"` renders nearly invisible. Add
+        # markers so fresh indicators show up immediately.
+        mode = "lines" if len(plot_s) >= 3 else "lines+markers"
+        fig.add_trace(
+            go.Scatter(
+                x=plot_s.index,
+                y=plot_s.values,
+                mode=mode,
+                line=dict(width=2.2, color=line_color),
+                marker=dict(size=6, color=line_color, line=dict(color="rgba(0,0,0,0)", width=0)),
+                fill="tozeroy",
+                fillcolor=_rgb_to_rgba(line_color, 0.10),
+                name=title,
+            )
+        )
     # Current-value dot, coloured by the live top-risk score (green→red).
-    if not np.isnan(score):
+    if not plot_s.empty and not np.isnan(score):
         fig.add_trace(
             go.Scatter(
                 x=[plot_s.index[-1]],
                 y=[float(plot_s.iloc[-1])],
                 mode="markers",
-                marker=dict(size=11, color=score_color, line=dict(color="#ffffff", width=1.2)),
+                marker=dict(size=12, color=score_color, line=dict(color="#ffffff", width=1.2)),
                 showlegend=False,
                 hovertemplate=f"now · top-risk {score:.0f}<extra></extra>",
             )
@@ -350,12 +373,14 @@ def _line(
     subt = ""
     if not np.isnan(score):
         subt = f" — current top-risk score {score:.0f}"
+    _show_legend = overlay_s is not None and not overlay_s.empty
     fig.update_layout(
         title=dict(text=f"{title}{subt}", font=dict(size=14)),
         height=height,
         margin=dict(l=10, r=10, t=48, b=10),
         hovermode="x unified",
-        showlegend=False,
+        showlegend=_show_legend,
+        legend=dict(orientation="h", yanchor="bottom", y=1.0, x=0, font=dict(size=10)),
         template="plotly_dark",
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
@@ -463,37 +488,9 @@ except Exception:
     prev_exp = None
 
 
-def _read_confidence(scores_df: pd.DataFrame, covered_weight: float) -> dict:
-    """How much to trust today's composite: model coverage, indicator agreement
-    (score dispersion), and data freshness. Each precise composite number is only
-    as good as how much of the model is online, how aligned it is, and how stale."""
-    scored = scores_df.dropna(subset=["score"])
-    n_contrib, total = int(len(scored)), int(len(scores_df))
-    dispersion = float(scored["score"].std()) if len(scored) > 1 else np.nan
-    now = datetime.now()
-    ages = [
-        (now - pd.Timestamp(a).to_pydatetime().replace(tzinfo=None)).days
-        for a in scored["as_of"].tolist()
-        if a is not None
-    ]
-    staleness = max(ages) if ages else None
-
-    # Three-tier rating from the weakest dimension.
-    if covered_weight >= 0.8 and (staleness is None or staleness <= 10) and (np.isnan(dispersion) or dispersion <= 25):
-        level, color = "High", "#16a085"
-    elif covered_weight >= 0.6 and (staleness is None or staleness <= 21):
-        level, color = "Medium", "#e67e22"
-    else:
-        level, color = "Low", "#c0392b"
-    return {
-        "level": level, "color": color,
-        "coverage_pct": covered_weight * 100.0,
-        "n_contrib": n_contrib, "total": total,
-        "dispersion": dispersion, "staleness": staleness,
-    }
-
-
-CONFIDENCE = _read_confidence(scores, COVERED_WEIGHT)
+# Trust calc lives in src.indicators.read_confidence (pure logic, unit-tested):
+# unknown freshness now caps confidence at Low instead of passing as fresh.
+CONFIDENCE = read_confidence(scores, COVERED_WEIGHT)
 
 
 # ---------------------------------------------------------------------------
@@ -503,39 +500,109 @@ st.markdown(f"## Market Regime — {datetime.now().strftime('%A, %b %d %Y')}")
 
 hc1, hc_exp, hc2, hc3, hc4 = st.columns([1.25, 1.4, 0.95, 0.95, 1.0])
 
-gauge_steps = get_regime_step_config(DEFAULT_REGIME_COLORS)
+
+def _score_to_angle(s: float) -> float:
+    """Map a 0-100 score onto the half-gauge: 0 -> 180° (left), 100 -> 0° (right)."""
+    return 180.0 - 1.8 * float(np.clip(s, 0.0, 100.0))
+
 
 with hc1:
     st.markdown("**Composite Regime Score**")
-    score_val = composite_score if not np.isnan(composite_score) else 0
+    GAUGE = gauge_state(composite_score)
 
     if "regime_band_filter" not in st.session_state:
         st.session_state.regime_band_filter = None
 
-    gauge = go.Figure(go.Indicator(
-        mode="gauge+number",
-        value=score_val,
-        number={"font": {"size": 56, "color": color}, "valueformat": ".1f"},
-        gauge={
-            "axis": {"range": [0, 100], "tickwidth": 1, "tickcolor": "rgba(255,255,255,0.5)"},
-            "bar": {"color": "rgba(0,0,0,0)", "thickness": 0},
-            "bgcolor": "rgba(0,0,0,0)",
-            "borderwidth": 0,
-            "steps": gauge_steps,
-            "threshold": {
-                "line": {"color": "#ffffff", "width": 7},
-                "thickness": 1.0,
-                "value": score_val,
-            },
-        },
-    ))
-    gauge.update_layout(
-        height=260,
-        margin=dict(l=10, r=10, t=30, b=10),
-        paper_bgcolor="rgba(0,0,0,0)",
-        font=dict(color="white"),
-    )
-    st.plotly_chart(gauge, width="stretch")
+    if GAUGE["status"] == "offline":
+        # Never draw a NaN composite as 0.0 — on this scale 0 reads as
+        # "capitulation / aggressive buy", the opposite of "model offline".
+        st.error(
+            "**MODEL OFFLINE — composite unavailable.** No indicator passed the "
+            "minimum-history gate or all data sources are down. No reading is "
+            "shown rather than a fake 0. Check the confidence chip and the "
+            "indicator table below for which feeds are dark."
+        )
+    else:
+        score_val = GAUGE["value"]
+        # Gauge: each regime band is a barpolar segment. The regime-chart
+        # filter is the dropdown below (Plotly click-select doesn't fire on
+        # barpolar traces, so the bands are display-only); the selected
+        # regime's band stays lit while the others dim.
+        _names = [name for _, _, _, name in DEFAULT_REGIME_COLORS]
+        _pretty = [
+            f"{mn:.0f}–{mx:.0f} · {name.replace('_', ' ').title()}"
+            for mn, mx, _, name in DEFAULT_REGIME_COLORS
+        ]
+        # Read the dropdown's widget state directly (it renders below the
+        # gauge) so the band highlight updates on the same rerun, not one
+        # behind.
+        _sel_label = st.session_state.get("regime_band_filter_select")
+        if _sel_label is not None:
+            _cur_filter = next(
+                (name for i, name in enumerate(_names) if _pretty[i] == _sel_label), None
+            )
+        else:
+            _cur_filter = st.session_state.regime_band_filter
+        _sel_idx = _names.index(_cur_filter) if _cur_filter in _names else None
+        gauge = go.Figure()
+        gauge.add_trace(
+            go.Barpolar(
+                theta=[_score_to_angle((mn + mx) / 2) for mn, mx, _, _ in DEFAULT_REGIME_COLORS],
+                width=[1.8 * (mx - mn) for mn, mx, _, _ in DEFAULT_REGIME_COLORS],
+                r=[0.38] * len(DEFAULT_REGIME_COLORS),
+                base=0.62,
+                marker=dict(
+                    color=[hex_c for _, _, hex_c, _ in DEFAULT_REGIME_COLORS],
+                    line=dict(color="rgba(0,0,0,0.35)", width=1),
+                ),
+                customdata=_names,
+                text=_pretty,
+                hovertemplate="%{text}<extra></extra>",
+                selectedpoints=[_sel_idx] if _sel_idx is not None else None,
+                selected=dict(marker=dict(opacity=1.0)),
+                unselected=dict(marker=dict(opacity=0.35 if _sel_idx is not None else 1.0)),
+            )
+        )
+        # Needle — lines only, drawn above the bands.
+        _ang = _score_to_angle(score_val)
+        gauge.add_trace(
+            go.Scatterpolar(
+                theta=[_ang, _ang],
+                r=[0.56, 1.03],
+                mode="lines",
+                line=dict(color="#ffffff", width=5),
+                hoverinfo="skip",
+                showlegend=False,
+            )
+        )
+        gauge.add_annotation(
+            x=0.5, y=0.10, xref="paper", yref="paper",
+            text=f"{score_val:.1f}", showarrow=False,
+            font=dict(size=56, color=color),
+        )
+        gauge.update_layout(
+            height=260,
+            margin=dict(l=24, r=24, t=30, b=10),
+            paper_bgcolor="rgba(0,0,0,0)",
+            font=dict(color="white"),
+            showlegend=False,
+            polar=dict(
+                bgcolor="rgba(0,0,0,0)",
+                sector=[0, 180],
+                radialaxis=dict(visible=False, range=[0, 1.06]),
+                angularaxis=dict(
+                    rotation=0,
+                    direction="counterclockwise",
+                    tickmode="array",
+                    tickvals=[_score_to_angle(v) for v in (0, 20, 40, 60, 80, 100)],
+                    ticktext=["0", "20", "40", "60", "80", "100"],
+                    tickfont=dict(size=12, color="rgba(255,255,255,0.65)"),
+                    showline=False,
+                    gridcolor="rgba(0,0,0,0)",
+                ),
+            ),
+        )
+        st.plotly_chart(gauge, width="stretch", config={"displayModeBar": False})
     st.markdown(
         f"<div style='text-align:center;'><span class='pill' style='background:{color}'>{emoji}</span>"
         f"<b>{label}</b></div>",
@@ -545,15 +612,16 @@ with hc1:
     # Confidence chip — how much to trust the precise number above.
     _cf = CONFIDENCE
     _disp = "—" if _cf["dispersion"] is None or np.isnan(_cf["dispersion"]) else f"{_cf['dispersion']:.0f}"
-    _stale = "—" if _cf["staleness"] is None else f"{_cf['staleness']}d"
+    _stale = "unknown" if _cf["staleness"] is None else f"{_cf['staleness']}d"
     _agree_txt = "aligned" if (_cf["dispersion"] is not None and not np.isnan(_cf["dispersion"]) and _cf["dispersion"] <= 25) else "mixed"
+    _proxy_txt = f" · {_cf['n_proxy']} proxy/fallback feeds" if _cf.get("n_proxy") else ""
     st.markdown(
         f"""
 <div style='text-align:center; margin-top:8px;'>
   <span class='pill' style='background:{_cf['color']}'>CONFIDENCE: {_cf['level']}</span>
   <div class='sub' style='margin-top:4px;'>
     {_cf['n_contrib']}/{_cf['total']} indicators · {_cf['coverage_pct']:.0f}% of model weight ·
-    spread {_disp} ({_agree_txt}) · freshest gap {_stale}
+    spread {_disp} ({_agree_txt}) · stalest feed {_stale}{_proxy_txt}
   </div>
 </div>
 """,
@@ -920,12 +988,29 @@ def _fmt_raw_cell(row: pd.Series) -> str:
     return f"{val} {unit}".strip() if unit else val
 
 
+def _fmt_live_source(row: pd.Series) -> str:
+    """What ACTUALLY served this indicator this build — config's static source
+    string only when nothing was recorded. Proxies/fallbacks get a badge so
+    degraded feeds can't masquerade as their primary source."""
+    used = row.get("source_used")
+    kind = row.get("source_kind")
+    used = None if (used is None or (isinstance(used, float) and pd.isna(used)) or used == "") else used
+    kind = None if (kind is None or (isinstance(kind, float) and pd.isna(kind))) else kind
+    if used is None and kind != "unavailable":
+        return INDICATORS_BY_KEY.get(row.get("key"), None).source if row.get("key") in INDICATORS_BY_KEY else "—"
+    if kind == "unavailable":
+        return "OFFLINE"
+    badge = {"proxy": " ⚠ proxy", "fallback": " ⚠ fallback", "cache": " (cache)"}.get(kind, "")
+    return f"{used}{badge}"
+
+
 tbl = scores.copy()
 tbl["raw"] = tbl.apply(_fmt_raw_cell, axis=1)
 tbl["percentile"] = tbl["percentile"].round(1)
 tbl["score"] = tbl["score"].round(1)
 tbl["bucket"] = tbl["bucket"].map(pillar_names)
 tbl["as_of"] = pd.to_datetime(tbl["as_of"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("—")
+tbl["source_live"] = tbl.apply(_fmt_live_source, axis=1)
 
 
 def _highlight_score(v):
@@ -940,7 +1025,17 @@ def _highlight_score(v):
     return "background-color: #16a085; color:white;"
 
 
-display_cols = ["label", "bucket", "raw", "percentile", "score", "as_of", "n_obs"]
+def _highlight_source(v):
+    if not isinstance(v, str):
+        return ""
+    if v == "OFFLINE":
+        return "color: #c0392b; font-weight: 600;"
+    if "⚠" in v:
+        return "color: #e67e22;"
+    return ""
+
+
+display_cols = ["label", "bucket", "raw", "percentile", "score", "as_of", "n_obs", "source_live"]
 styled = tbl[display_cols].rename(columns={
     "label": "Indicator",
     "bucket": "Pillar",
@@ -949,9 +1044,16 @@ styled = tbl[display_cols].rename(columns={
     "score": "Top-risk score",
     "as_of": "As of",
     "n_obs": "Obs",
-}).style.map(_highlight_score, subset=["Top-risk score"])
+    "source_live": "Source (live)",
+}).style.map(_highlight_score, subset=["Top-risk score"]).map(_highlight_source, subset=["Source (live)"])
 
 st.dataframe(styled, width="stretch", hide_index=True)
+st.caption(
+    "**Source (live)** = the feed that actually served this build "
+    "(⚠ = proxy/fallback, OFFLINE = no data). Indicators with fewer than "
+    "60 observations are excluded from the composite and cluster — a score of "
+    "“—” with a low Obs count means the feed is honest-but-thin, not broken."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1382,22 +1484,32 @@ st.caption(
     "**Gamma Flip Zone** = distance to zero-gamma price. Negative = below flip = unstable regime. "
     "Extreme negative readings = structural selling exhausted = bottom."
 )
+st.caption(
+    "Dashed grey = synthetic/legacy backfill, shown for context only — it is "
+    "**excluded** from scoring, the min-history gate and the cluster signal. "
+    "The solid line is measured data (CBOE delayed-chain snapshots), rebuilding "
+    "one point per trading day."
+)
 gx1, gx2 = st.columns(2)
 with gx1:
     _line(
         raw.series.get("gamma_exposure"),
         "Gamma Exposure Proxy ($B notional)",
         ref_lines=[(0, "zero gamma"), (-5, "negative = forced selling")],
+        indicator_key="gamma_exposure",
         extra_direction="risk_high_is_top",
         marker_ts=ts_marker,
+        display_overlay=raw.display.get("gamma_exposure"),
     )
 with gx2:
     _line(
         raw.series.get("gamma_flip_zone"),
         "Gamma Flip Zone Distance (%)",
         ref_lines=[(0, "at flip zone"), (-2, "below flip = negative gamma")],
+        indicator_key="gamma_flip_zone",
         extra_direction="contrarian_high_is_top",
         marker_ts=ts_marker,
+        display_overlay=raw.display.get("gamma_flip_zone"),
     )
 
 
@@ -1608,8 +1720,11 @@ with st.expander("Why is the composite where it is?  (extreme-cluster detail)"):
 # SOURCES
 # ---------------------------------------------------------------------------
 with st.expander("Data sources & methodology"):
+    _live_src_by_key = dict(zip(tbl["key"], tbl["source_live"]))
     src_rows = [
-        {"Indicator": i.label, "Bucket": i.bucket, "Source": i.source,
+        {"Indicator": i.label, "Bucket": i.bucket,
+         "Configured source": i.source,
+         "Live source (this build)": _live_src_by_key.get(i.key, "—"),
          "Direction": i.direction, "Note": i.description}
         for i in INDICATORS
     ]
@@ -1618,7 +1733,9 @@ with st.expander("Data sources & methodology"):
         "**Scoring**: every indicator is converted to a 3-year rolling percentile, "
         "oriented so 100 = complacency / top-risk and 0 = panic / bottom-setup. "
         "Bucket scores are equal-weighted within bucket; composite is a weighted "
-        "average across the 4 buckets using the weights shown in the sidebar."
+        "average across the 4 buckets using the weights shown in the sidebar. "
+        "**Live source** shows which feed actually served each indicator this "
+        "build — ⚠ marks proxies and fallbacks, OFFLINE marks dark feeds."
     )
 
 

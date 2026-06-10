@@ -9,3 +9,5 @@ cache/
 .yfinance_cache/
 .venv/
 venv/
+.pytest_cache/
+.playwright-mcp/

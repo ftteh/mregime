@@ -175,7 +175,8 @@ INDICATORS: list[IndicatorSpec] = [
         key="equity_risk_premium", label="Equity Risk Premium",
         bucket="valuation", source="computed: SPX EP - US10Y",
         direction="contrarian_high_is_top",
-        description="SPX earnings yield minus 10Y. Negative = expensive. INVERTED: high ERP = cheap.",
+        description="SPX earnings yield minus 10Y, z-scored vs its own 1y regime (like real yields, it trends with the secular rate regime — the raw level pinned the 3y percentile near the tail through the whole 2023-25 high-rate era, turning the valuation pillar into a constant vote). Negative = expensive. INVERTED: high ERP = cheap.",
+        transform="zscore",
     ),
 
     # 5. CTA / Institutional Positioning (bonus — folded into sentiment pillar)

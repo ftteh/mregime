@@ -88,6 +88,50 @@ def reset_fetch_memo() -> None:
     with _FETCH_MEMO_GUARD:
         _FETCH_MEMO.clear()
         _FETCH_MEMO_LOCKS.clear()
+        _PROVENANCE.clear()
+        _DISPLAY_OVERLAYS.clear()
+
+
+# ---------------------------------------------------------------------------
+# Per-build provenance: which source ACTUALLY served each indicator
+# ---------------------------------------------------------------------------
+# Most fetchers have multi-level fallback chains (yfinance → CBOE CSV,
+# FRED api → FRED CSV, official put/call → YCharts → live ETF-chain proxy).
+# The config's static `source` string describes the design, not the build —
+# without this registry a proxy or fallback silently masquerades as the
+# primary feed in the UI. Keys are the indicator keys from build_raw's task
+# dict so the dashboard can join provenance onto scores/meta.
+_PROVENANCE: dict[str, dict] = {}
+
+# Series that are shown on charts for context but are NOT real measurements
+# (synthetic backfills, legacy mixed-methodology cache rows). They must never
+# enter scoring/MIN_OBS/cluster; the UI renders them visibly distinct.
+_DISPLAY_OVERLAYS: dict[str, pd.Series] = {}
+
+
+def record_provenance(key: str, source: str, *, kind: str = "primary", note: str = "") -> None:
+    """kind: 'primary' | 'fallback' | 'proxy' | 'cache' | 'computed' | 'unavailable'."""
+    with _FETCH_MEMO_GUARD:
+        _PROVENANCE[key] = {"source": source, "kind": kind, "note": note}
+
+
+def get_provenance() -> dict[str, dict]:
+    """Snapshot of this build's provenance registry."""
+    with _FETCH_MEMO_GUARD:
+        return {k: dict(v) for k, v in _PROVENANCE.items()}
+
+
+def _set_display_overlay(key: str, s: pd.Series) -> None:
+    if s is None or s.empty:
+        return
+    with _FETCH_MEMO_GUARD:
+        _DISPLAY_OVERLAYS[key] = s
+
+
+def get_display_overlays() -> dict[str, pd.Series]:
+    """Snapshot of this build's display-only (non-scored) overlay series."""
+    with _FETCH_MEMO_GUARD:
+        return dict(_DISPLAY_OVERLAYS)
 
 
 def _memoized_fetch(fn):
@@ -125,13 +169,16 @@ def _memoized_fetch(fn):
 # ---------------------------------------------------------------------------
 # FRED
 # ---------------------------------------------------------------------------
-def _fred(series_id: str, start: str = "2015-01-01") -> pd.Series:
+def _fred(series_id: str, start: str = "2015-01-01", prov_key: str | None = None) -> pd.Series:
     """
     Pull a FRED series.
     - If FRED_API_KEY is set, use fredapi (fast, reliable).
     - Otherwise try CSV fallback with a VERY short timeout — if the user's
       network can't reach fred.stlouisfed.org (common on residential ISPs
       behind CloudFront), we fail instantly rather than hanging the dashboard.
+
+    `prov_key`: indicator key to record provenance under (only single-series
+    indicators pass it; composite fetchers record at their own level).
     """
     if FRED_API_KEY:
         try:
@@ -139,6 +186,8 @@ def _fred(series_id: str, start: str = "2015-01-01") -> pd.Series:
             f = Fred(api_key=FRED_API_KEY)
             s = f.get_series(series_id, observation_start=start)
             s.name = series_id
+            if prov_key:
+                record_provenance(prov_key, f"fred_api:{series_id}", kind="primary")
             return s.dropna()
         except Exception as e:
             # FRED intermittently 500s on certain series (esp. RRPONTSYD).
@@ -162,24 +211,31 @@ def _fred(series_id: str, start: str = "2015-01-01") -> pd.Series:
         s.name = series_id
         s.index.name = "date"
         if not s.empty:
+            if prov_key:
+                record_provenance(
+                    prov_key, f"fred_csv:{series_id}", kind="fallback",
+                    note="" if FRED_API_KEY else "no FRED_API_KEY",
+                )
             return s.loc[start:]
     except Exception as e:
         log.info("FRED CSV %s unavailable (%s) — set FRED_API_KEY", series_id, str(e)[:60])
+    if prov_key:
+        record_provenance(prov_key, "", kind="unavailable")
     return pd.Series(dtype=float, name=series_id)
 
 
 @_memoized_fetch
 def fred_hy_spread() -> pd.Series:
-    return _fred("BAMLH0A0HYM2")
+    return _fred("BAMLH0A0HYM2", prov_key="hy_spread")
 
 
 def fred_ig_spread() -> pd.Series:
-    return _fred("BAMLC0A0CM")
+    return _fred("BAMLC0A0CM", prov_key="ig_spread")
 
 
 def fred_nfci() -> pd.Series:
     """Chicago Fed National Financial Conditions Index (weekly)."""
-    return _fred("NFCI")
+    return _fred("NFCI", prov_key="financial_conditions")
 
 
 def fred_ted() -> pd.Series:
@@ -210,6 +266,14 @@ def fred_net_liquidity() -> pd.Series:
     df["net_liq"] = df["walcl"] - df["tga"].fillna(0) - df["rrp"].fillna(0)
     s = df["net_liq"].dropna()
     s.name = "net_liquidity"
+    if not s.empty:
+        record_provenance(
+            "net_liquidity", "fred:WALCL-WTREGEN-RRPONTSYD",
+            kind="primary" if FRED_API_KEY else "fallback",
+            note="" if FRED_API_KEY else "no FRED_API_KEY (CSV endpoint)",
+        )
+    else:
+        record_provenance("net_liquidity", "", kind="unavailable")
     return s
 
 
@@ -282,31 +346,47 @@ def _cboe_index_history(symbol: str) -> pd.Series:
         return pd.Series(dtype=float, name=symbol)
 
 
+def _yf_or_cboe(prov_key: str, ticker: str, cboe_symbol: str) -> pd.Series:
+    """yfinance primary, official CBOE index-history CSV fallback — recorded."""
+    s = yf_series(ticker)
+    if not s.empty:
+        record_provenance(prov_key, f"yfinance:{ticker}", kind="primary")
+        return s
+    s = _cboe_index_history(cboe_symbol)
+    if not s.empty:
+        record_provenance(prov_key, f"cboe_csv:{cboe_symbol}", kind="fallback")
+    else:
+        record_provenance(prov_key, "", kind="unavailable")
+    return s
+
+
 @_memoized_fetch
 def vix() -> pd.Series:
-    s = yf_series("^VIX")
-    return s if not s.empty else _cboe_index_history("VIX")
+    return _yf_or_cboe("vix", "^VIX", "VIX")
 
 
 def vvix() -> pd.Series:
-    s = yf_series("^VVIX")
-    return s if not s.empty else _cboe_index_history("VVIX")
+    return _yf_or_cboe("vvix", "^VVIX", "VVIX")
 
 
 def skew() -> pd.Series:
-    s = yf_series("^SKEW")
-    return s if not s.empty else _cboe_index_history("SKEW")
+    return _yf_or_cboe("skew", "^SKEW", "SKEW")
 
 
 @_memoized_fetch
 def spx() -> pd.Series:
     s = yf_series("^GSPC")
     if not s.empty:
+        record_provenance("spx", "yfinance:^GSPC", kind="primary")
         return s
     # FRED carries the S&P 500 daily close (trailing ~10y) — enough for the
     # regime-band chart, RSI and percentile scoring when Yahoo is blocked.
     fb = _fred("SP500")
     fb.name = "^GSPC"
+    record_provenance(
+        "spx", "fred:SP500" if not fb.empty else "",
+        kind="fallback" if not fb.empty else "unavailable",
+    )
     return fb
 
 
@@ -374,12 +454,16 @@ def move_index() -> pd.Series:
     """
     tlt = yf_series("TLT", period="5y")
     if tlt.empty:
+        record_provenance("move_index", "", kind="unavailable")
         return pd.Series(dtype=float, name="move_proxy")
     log_ret = np.log(tlt / tlt.shift(1))
     vol_ann = log_ret.rolling(20).std() * np.sqrt(252) * 100
     # Scale roughly into MOVE units (MOVE ~ 80-200 range, TLT rv ~ 8-25%)
     proxy = vol_ann * 8
     proxy.name = "move_proxy"
+    # Always a proxy (the real ICE MOVE index is not free) — surfaced as such.
+    record_provenance("move_index", "tlt_realized_vol_proxy", kind="proxy",
+                      note="TLT 20d realized vol scaled; not the ICE MOVE index")
     return proxy.dropna()
 
 
@@ -494,7 +578,12 @@ def breadth_pct_above_200dma(sample_size: int = 120) -> pd.Series:
     """
     panel, wanted = _panel_columns(sample_size)
     if not wanted:
+        record_provenance("pct_above_200dma", "", kind="unavailable")
         return pd.Series(dtype=float, name="pct_above_200dma")
+    record_provenance(
+        "pct_above_200dma", f"sp500_sample_panel(top {len(wanted)})", kind="computed",
+        note="current-membership sample (survivorship); >0.97 corr w/ full index",
+    )
 
     close_df = panel[wanted].ffill()
     ma200 = close_df.rolling(200).mean()
@@ -510,7 +599,12 @@ def new_highs_minus_lows(sample_size: int = 150) -> pd.Series:
     """52-week new highs minus new lows among a sample of SP500."""
     panel, wanted = _panel_columns(sample_size)
     if not wanted:
+        record_provenance("new_highs_lows", "", kind="unavailable")
         return pd.Series(dtype=float, name="new_highs_minus_lows")
+    record_provenance(
+        "new_highs_lows", f"sp500_sample_panel(top {len(wanted)})", kind="computed",
+        note="current-membership sample (survivorship)",
+    )
     cdf = panel[wanted].ffill()
     hi = cdf.rolling(252).max()
     lo = cdf.rolling(252).min()
@@ -856,6 +950,91 @@ def _save_series_cache(filename: str, series: pd.Series, col_name: str) -> None:
         log.warning("Cache write failed for %s: %s", filename, e)
 
 
+# ---------------------------------------------------------------------------
+# Provenance-aware series cache (schema: date,<col>,source)
+# ---------------------------------------------------------------------------
+# Used where rows of DIFFERENT methodologies/units could otherwise end up in
+# one persisted series (the gamma caches mixed SqueezeMetrics GEX, CBOE
+# snapshot GEX, an ad-hoc yfinance heuristic and a scaled-GEX synthetic
+# backfill with no marker). The `source` column makes every row attributable
+# so scoring can use measured rows only.
+GAMMA_SCORED_SOURCES = {"squeezemetrics", "cboe_snapshot"}
+
+
+def _empty_sourced_frame(col_name: str) -> pd.DataFrame:
+    return pd.DataFrame(
+        {col_name: pd.Series(dtype=float), "source": pd.Series(dtype=str)},
+        index=pd.DatetimeIndex([], name="date"),
+    )
+
+
+def _load_series_cache_with_source(filename: str, col_name: str) -> pd.DataFrame:
+    """Load a cached series WITH per-row provenance.
+
+    MIGRATION: old-schema files (date,<col>) are rewritten once with every
+    pre-existing row marked source='legacy_mixed' (display-only). Rows written
+    before provenance tracking interleave different methodologies/units and
+    cannot be attributed post-hoc — quarantining them wholesale is the only
+    rule that never promotes fabricated data back into scoring. Idempotent.
+    """
+    path = _series_cache_path(filename)
+    if not os.path.exists(path):
+        return _empty_sourced_frame(col_name)
+    try:
+        df = pd.read_csv(path, parse_dates=["date"])
+        if "date" not in df.columns or col_name not in df.columns:
+            return _empty_sourced_frame(col_name)
+        df[col_name] = pd.to_numeric(df[col_name], errors="coerce")
+        df = df.dropna(subset=["date", col_name]).set_index("date").sort_index()
+        migrated = "source" not in df.columns
+        if migrated:
+            df["source"] = "legacy_mixed"
+        else:
+            df["source"] = df["source"].fillna("legacy_mixed").astype(str)
+        out = df[[col_name, "source"]]
+        out = out[~out.index.duplicated(keep="last")]
+        out.index.name = "date"
+        if migrated:
+            _save_series_cache_with_source(filename, out, col_name)
+        return out
+    except Exception as e:
+        log.warning("Sourced cache read failed for %s: %s", filename, e)
+        return _empty_sourced_frame(col_name)
+
+
+def _save_series_cache_with_source(filename: str, df: pd.DataFrame, col_name: str) -> None:
+    path = _series_cache_path(filename)
+    try:
+        out = df[[col_name, "source"]].copy()
+        out[col_name] = pd.to_numeric(out[col_name], errors="coerce")
+        out = out.dropna(subset=[col_name])
+        out = out[~out.index.duplicated(keep="last")].sort_index()
+        out.index.name = "date"
+        out.reset_index().to_csv(path, index=False)
+    except Exception as e:
+        log.warning("Cache write failed for %s: %s", filename, e)
+
+
+def _upsert_sourced_rows(
+    df: pd.DataFrame, s: pd.Series, col_name: str, source: str
+) -> pd.DataFrame:
+    """Insert/overwrite rows from `s` labeled with `source` (new rows win on
+    duplicate dates — measured data overrides legacy rows for the same day)."""
+    if s is None or s.empty:
+        return df
+    vals = pd.to_numeric(pd.Series(s.values, index=pd.DatetimeIndex(s.index)), errors="coerce")
+    if getattr(vals.index, "tz", None) is not None:
+        vals.index = vals.index.tz_localize(None)
+    vals = vals.dropna()
+    if vals.empty:
+        return df
+    add = pd.DataFrame({col_name: vals.values, "source": source}, index=vals.index)
+    out = pd.concat([df, add])
+    out = out[~out.index.duplicated(keep="last")].sort_index()
+    out.index.name = "date"
+    return out
+
+
 def _merge_series(name: str, *series: pd.Series) -> pd.Series:
     parts = []
     for s in series:
@@ -879,6 +1058,60 @@ def _merge_series(name: str, *series: pd.Series) -> pd.Series:
     merged = merged[~merged.index.duplicated(keep="last")].sort_index()
     merged.name = name
     return merged
+
+
+# ---------------------------------------------------------------------------
+# US trading-day calendar — honest stamping for live snapshot values
+# ---------------------------------------------------------------------------
+@lru_cache(maxsize=1)
+def _us_busday_calendar() -> np.busdaycalendar:
+    """Weekend + US-federal-holiday calendar. Approximation of the NYSE
+    calendar (lacks Good Friday, includes Columbus/Veterans Day) — only the
+    fallback path uses it; live runs prefer the real SPX market calendar."""
+    from pandas.tseries.holiday import USFederalHolidayCalendar
+
+    hols = USFederalHolidayCalendar().holidays(start="2000-01-01", end="2040-12-31")
+    return np.busdaycalendar(holidays=hols.values.astype("datetime64[D]"))
+
+
+def _trading_day_mask(idx: pd.DatetimeIndex) -> np.ndarray:
+    """Boolean mask: which index dates fall on a US trading day."""
+    if len(idx) == 0:
+        return np.array([], dtype=bool)
+    days = idx.normalize().values.astype("datetime64[D]")
+    return np.is_busday(days, busdaycal=_us_busday_calendar())
+
+
+def last_completed_trading_day(now: pd.Timestamp | None = None) -> pd.Timestamp:
+    """Last completed US equity trading day — the only honest stamp for a live
+    snapshot value. `pd.Timestamp.today()` stamped weekend/holiday phantom
+    dates into the caches and made `as_of` read "today" for stale data.
+
+    Authority order:
+    1. The fetched SPX series' last index date (real market calendar; memoized
+       per build, so this adds no network cost) when within 7 days of `now`.
+    2. Fallback: previous day per the US-federal-holiday business calendar —
+       conservative: prefers a 1-day-stale label over a phantom today-stamp,
+       since without market data we cannot know whether today's session closed.
+    """
+    if now is None:
+        now = pd.Timestamp.now()
+    now = pd.Timestamp(now)
+    try:
+        s = spx()
+        if s is not None and not s.empty:
+            last = pd.Timestamp(s.index[-1])
+            if getattr(last, "tz", None) is not None:
+                last = last.tz_localize(None)
+            last = last.normalize()
+            age = now.normalize() - last
+            if pd.Timedelta(0) <= age <= pd.Timedelta(days=7):
+                return last
+    except Exception:
+        pass
+    d = (now.normalize() - pd.Timedelta(days=1)).to_datetime64().astype("datetime64[D]")
+    prev = np.busday_offset(d, 0, roll="backward", busdaycal=_us_busday_calendar())
+    return pd.Timestamp(prev)
 
 
 def _read_cboe_put_call_csv(url: str, name: str) -> pd.Series:
@@ -1030,11 +1263,12 @@ def _official_put_call_series(
     recent = _ycharts_recent_indicator(ycharts_slug, name)
     cache = _load_series_cache(cache_filename, name)
     if not cache.empty:
-        cache = cache[cache.index.dayofweek < 5]
+        # Scrub previously-persisted phantom dates (weekend/holiday stamps
+        # written before trading-day-aware stamping existed).
+        cache = cache[_trading_day_mask(cache.index)]
 
     live = pd.Series(dtype=float, name=name)
-    today = pd.Timestamp.today().normalize()
-    last_market_day = today if today.dayofweek < 5 else today - pd.offsets.BDay(1)
+    last_market_day = last_completed_trading_day()
     recent_last = recent.index.max().normalize() if not recent.empty else pd.Timestamp.min
     if recent_last < last_market_day:
         live_val = _cboe_live_put_call_ratio(live_symbols)
@@ -1044,6 +1278,24 @@ def _official_put_call_series(
     merged = _merge_series(name, hist, cache, recent, live)
     if not live.empty:
         _save_series_cache(cache_filename, merged, name)
+
+    # Provenance: which legs contributed, and whether the LAST row (the one
+    # the live score reads) came from the intraday ETF-chain proxy.
+    legs = [
+        lbl for lbl, leg in (
+            ("cboe_official", hist), ("ycharts", recent),
+            ("cache", cache), ("live_etf_chain_proxy", live),
+        ) if not leg.empty
+    ]
+    if merged.empty:
+        record_provenance(name, "", kind="unavailable")
+    else:
+        last_from_live = (not live.empty) and merged.index[-1] == live.index[-1]
+        record_provenance(
+            name, "+".join(legs),
+            kind="fallback" if last_from_live else "primary",
+            note="last row provisional (intraday ETF-chain proxy)" if last_from_live else "",
+        )
     return merged
 
 
@@ -1114,11 +1366,18 @@ def equity_risk_premium() -> pd.Series:
     pe = sp500_pe_ratio()
     ten = fred_dgs10()
     if pe.empty or ten.empty:
+        record_provenance("equity_risk_premium", "", kind="unavailable",
+                          note="multpl P/E or 10Y yield feed missing")
         return pd.Series(dtype=float, name="erp")
     ey = 100.0 / pe  # earnings yield in percent
     ey_daily = ey.sort_index().reindex(ten.index, method="ffill")
     erp = (ey_daily - ten).dropna()
     erp.name = "erp"
+    pe_age_days = int((ten.index[-1] - pe.index[-1]).days) if len(pe) else -1
+    record_provenance(
+        "equity_risk_premium", "multpl_pe+fred_dgs10", kind="primary",
+        note=f"monthly P/E ffilled to daily; P/E print {pe_age_days}d old",
+    )
     return erp
 
 
@@ -1158,24 +1417,28 @@ def _squeezemetrics_csv() -> pd.DataFrame:
     Fetch the SqueezeMetrics public CSV. Returns DataFrame with date index
     and columns for dix, gex (if present). Cached to avoid repeat calls.
 
-    The free endpoint was paywalled in late 2024 ($720/mo). We try it
-    anyway — if it returns data, great; if not, we fall back gracefully.
+    The endpoint was paywalled in late 2024 but currently serves the full
+    history again — treat it as flaky, not gone. The ~200KB download can
+    exceed a short timeout while ~30 fetchers share the line on a cold
+    build, so retry once before giving up.
     """
     urls = [
         "https://squeezemetrics.com/monitor/static/DIX.csv",
     ]
     for url in urls:
-        try:
-            r = requests.get(url, headers=UA, timeout=10)
-            if r.ok and "," in r.text and len(r.text) > 100:
-                df = pd.read_csv(io.StringIO(r.text))
-                df.columns = [c.strip().lower() for c in df.columns]
-                if "date" in df.columns:
-                    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-                    df = df.dropna(subset=["date"]).set_index("date").sort_index()
-                    return df
-        except Exception as e:
-            log.info("SqueezeMetrics CSV fetch failed: %s", e)
+        for attempt in (1, 2):
+            try:
+                r = requests.get(url, headers=UA, timeout=20)
+                if r.ok and "," in r.text and len(r.text) > 100:
+                    df = pd.read_csv(io.StringIO(r.text))
+                    df.columns = [c.strip().lower() for c in df.columns]
+                    if "date" in df.columns:
+                        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+                        df = df.dropna(subset=["date"]).set_index("date").sort_index()
+                        return df
+                break  # got a response but not parseable data — retry won't help
+            except Exception as e:
+                log.info("SqueezeMetrics CSV fetch failed (attempt %d): %s", attempt, e)
     return pd.DataFrame()
 
 
@@ -1184,25 +1447,40 @@ def dix_proxy() -> pd.Series:
     Dark Index (DIX) — proportion of dark pool volume that is buying.
     Rising DIX during a sell-off = institutional accumulation.
 
-    Source: SqueezeMetrics free CSV (may be paywalled).
+    Source: SqueezeMetrics public CSV. Last-good copy persisted to
+    cache/dix_history.csv so a transient fetch failure degrades to
+    stale-but-real history instead of an empty chart (the empty result
+    would otherwise be pinned for an hour by the app-level cache).
     """
     df = _squeezemetrics_csv()
     if not df.empty and "dix" in df.columns:
         s = df["dix"].astype(float).dropna()
         s.name = "dix"
+        _save_series_cache("dix_history.csv", s, "dix")
+        record_provenance("dix", "squeezemetrics", kind="primary")
         return s
+    cached = _load_series_cache("dix_history.csv", "dix")
+    if not cached.empty:
+        record_provenance(
+            "dix", "squeezemetrics", kind="cache",
+            note=f"live fetch failed; cached history through {cached.index.max():%Y-%m-%d}",
+        )
+        return cached
+    record_provenance("dix", "", kind="unavailable",
+                      note="SqueezeMetrics fetch failed and no cached history")
     return pd.Series(dtype=float, name="dix")
 
 
 def _normalize_gex_units(s: pd.Series) -> pd.Series:
-    """Normalize GEX to $B; some public feeds/cache rows arrive as raw dollars."""
+    """Normalize a GEX series to $B. Decided per-SERIES (median |value|), not
+    per-row: the old per-row mask (abs > 1e6) left mid-range raw-dollar values
+    unconverted and could split one feed across two unit regimes."""
     out = pd.to_numeric(s.copy(), errors="coerce").dropna()
     if out.empty:
         out.name = "gamma_exposure"
         return out
-    dollar_mask = out.abs() > 1_000_000
-    if dollar_mask.any():
-        out.loc[dollar_mask] = out.loc[dollar_mask] / 1e9
+    if float(out.abs().median()) > 1e4:  # raw dollars, not $B
+        out = out / 1e9
     out.name = "gamma_exposure"
     return out
 
@@ -1302,14 +1580,14 @@ def cftc_cta_positioning() -> pd.Series:
 @_memoized_fetch
 def curve_2s10s() -> pd.Series:
     """10Y - 2Y Treasury yield spread (FRED T10Y2Y). Negative = inverted."""
-    s = _fred("T10Y2Y")
+    s = _fred("T10Y2Y", prov_key="curve_2s10s")
     s.name = "curve_2s10s"
     return s
 
 
 def curve_3m10y() -> pd.Series:
     """10Y - 3M Treasury yield spread (FRED T10Y3M). Fed's preferred recession curve."""
-    s = _fred("T10Y3M")
+    s = _fred("T10Y3M", prov_key="curve_3m10y")
     s.name = "curve_3m10y"
     return s
 
@@ -1436,21 +1714,6 @@ def sofr_spread() -> pd.Series:
 # ---------------------------------------------------------------------------
 # Gamma Exposure (GEX) - Options Market Structure
 # ---------------------------------------------------------------------------
-def _cache_path(filename: str) -> str:
-    """Return full path for a cache file."""
-    return _series_cache_path(filename)
-
-
-def _load_cache(filename: str, col_name: str) -> pd.Series:
-    """Load a cached time series from CSV."""
-    return _load_series_cache(filename, col_name)
-
-
-def _save_cache(filename: str, series: pd.Series, col_name: str):
-    """Save a time series to CSV cache."""
-    _save_series_cache(filename, series, col_name)
-
-
 def _cboe_gamma_snapshot(symbol: str = "SPY") -> tuple[float | None, float | None]:
     """
     Current GEX and gamma-flip distance from CBOE's delayed option-chain JSON.
@@ -1510,83 +1773,60 @@ def _gex_implied_gamma_flip_history(gex: pd.Series) -> pd.Series:
 @_memoized_fetch
 def gamma_exposure_proxy() -> pd.Series:
     """
-    Gamma Exposure (GEX) — estimated dealer gamma.
+    Gamma Exposure (GEX) — estimated dealer gamma, in $B per 1% move.
 
-    Strategy:
-    1. Try SqueezeMetrics historical GEX (daily, back to 2011 if available)
-    2. Fall back to live computation from SPY options chain + cache
+    Only MEASURED rows are returned for scoring and persisted as scoreable:
+      - 'squeezemetrics' : historical daily GEX (when the endpoint serves data)
+      - 'cboe_snapshot'  : naive GEX from CBOE's delayed option chain, which
+                           carries REAL per-contract greeks (_cboe_gamma_snapshot)
 
-    When GEX is:
-    - Deeply negative: Dealers must sell into weakness = crash accelerant
-    - Positive: Dealers buy dips, sell rips = stabilizing
+    Rows written before provenance tracking stay as 'legacy_mixed' and are
+    display-only: they interleaved SqueezeMetrics GEX, CBOE-snapshot GEX and an
+    ad-hoc yfinance heuristic (oi-weighted moneyness buckets — not gamma, on an
+    arbitrary scale) in one column. That heuristic is deleted outright: a real
+    Black-Scholes recomputation from yfinance impliedVolatility was considered
+    and rejected (poor IV/OI quality, and it would add yet another methodology
+    to one series). When no measured source is available the series is honestly
+    short/empty rather than padded with fabricated values.
+
+    When GEX is deeply negative, dealers must sell into weakness (crash
+    accelerant); positive GEX = dealers buy dips, sell rips (stabilizing).
     """
-    import yfinance as yf
+    df = _load_series_cache_with_source("gamma_exposure_history.csv", "gamma_exposure")
 
-    hist = _normalize_gex_units(_load_cache("gamma_exposure_history.csv", "gamma_exposure"))
-
-    # SqueezeMetrics, when available, gives the historical backbone.
+    # SqueezeMetrics, when available, gives the measured historical backbone.
     sqz = squeezemetrics_gex()
     if not sqz.empty:
-        hist = _merge_series("gamma_exposure", sqz, hist)
+        df = _upsert_sourced_rows(df, _normalize_gex_units(sqz), "gamma_exposure", "squeezemetrics")
 
     today_val, _ = _cboe_gamma_snapshot("SPY")
-    try:
-        if today_val is None:
-            with _silence_stderr():
-                t = yf.Ticker("SPY")
-                spot = t.info.get("regularMarketPrice", t.info.get("previousClose", 0))
-                if not spot:
-                    spot_hist = t.history(period="5d")["Close"].iloc[-1]
-                    spot = float(spot_hist)
-
-                all_expiries = list(t.options)
-                near_expiries = [e for e in all_expiries[:4] if e]
-
-                total_gamma = 0.0
-                total_dollars = 0.0
-
-                for expiry in near_expiries:
-                    try:
-                        chain = t.option_chain(expiry)
-                        calls = chain.calls
-                        puts = chain.puts
-
-                        for _, row in calls.iterrows():
-                            strike = row["strike"]
-                            oi = row.get("openInterest", 0) or 0
-                            if oi > 0:
-                                moneyness = abs(strike - spot) / spot
-                                gamma_weight = oi * max(0.1, 1 - moneyness * 5)
-                                total_gamma += gamma_weight * 0.01
-                                total_dollars += oi * row.get("lastPrice", 0) * 100
-
-                        for _, row in puts.iterrows():
-                            strike = row["strike"]
-                            oi = row.get("openInterest", 0) or 0
-                            if oi > 0:
-                                moneyness = abs(strike - spot) / spot
-                                gamma_weight = oi * max(0.1, 1 - moneyness * 5)
-                                if strike < spot:
-                                    total_gamma -= gamma_weight * 0.02
-                                total_dollars += oi * row.get("lastPrice", 0) * 100
-
-                    except Exception:
-                        continue
-
-                if total_dollars > 0:
-                    today_val = total_gamma / 1e9
-    except Exception as e:
-        log.info("Gamma exposure calculation failed: %s", str(e)[:80])
-
     if today_val is not None:
-        today = pd.Timestamp.today().normalize()
-        hist.loc[today] = today_val
-        hist = _normalize_gex_units(hist)
-        hist = hist[~hist.index.duplicated(keep="last")].sort_index()
-        _save_cache("gamma_exposure_history.csv", hist, "gamma_exposure")
+        stamp = last_completed_trading_day()
+        live = pd.Series([float(today_val)], index=[stamp])
+        df = _upsert_sourced_rows(df, live, "gamma_exposure", "cboe_snapshot")
 
-    hist.name = "gamma_exposure"
-    return hist
+    if today_val is not None or not sqz.empty:
+        _save_series_cache_with_source("gamma_exposure_history.csv", df, "gamma_exposure")
+
+    scored_mask = df["source"].isin(GAMMA_SCORED_SOURCES)
+    display_only = df.loc[~scored_mask, "gamma_exposure"]
+    if not display_only.empty:
+        _set_display_overlay("gamma_exposure", display_only.rename("gamma_exposure"))
+
+    out = df.loc[scored_mask, "gamma_exposure"].copy()
+    out.name = "gamma_exposure"
+    if out.empty:
+        record_provenance("gamma_exposure", "", kind="unavailable",
+                          note="no measured GEX source; legacy rows are display-only")
+    elif today_val is not None:
+        record_provenance("gamma_exposure", "cboe_delayed_options", kind="primary",
+                          note="naive GEX from real chain greeks; building history")
+    elif not sqz.empty:
+        record_provenance("gamma_exposure", "squeezemetrics", kind="primary")
+    else:
+        record_provenance("gamma_exposure", "cache(measured rows)", kind="cache",
+                          note="no live snapshot this build")
+    return out
 
 
 def gamma_flip_zone_distance() -> pd.Series:
@@ -1597,62 +1837,44 @@ def gamma_flip_zone_distance() -> pd.Series:
     Above flip = positive gamma (dealers sell highs, buy lows) = stable.
     Below flip = negative gamma (dealers sell lows, buy highs) = unstable.
 
-    Returns % distance from current price to estimated flip zone.
-    Positive = distance above flip (safe), Negative = below flip (danger).
-    Cached to build history over time.
+    Scored/persisted rows are MEASURED CBOE-snapshot estimates only (uniform
+    % distance units). The GEX-scaled synthetic backfill that used to be merged
+    and saved here is now display-only (_gex_implied_gamma_flip_history): it is
+    in scaled-GEX units, not % distance — persisting it polluted the cache,
+    satisfied MIN_OBS and fed the composite/cluster with fabricated extremes.
+    The old yfinance OI-weighted flip estimate is deleted for the same reason:
+    a second methodology (nearest expiry, OI-only, no gamma weighting) writing
+    into the same column.
     """
-    import yfinance as yf
-
-    hist = _load_cache("gamma_flip_history.csv", "gamma_flip")
-    gex_history = gamma_exposure_proxy()
-    proxy_hist = _gex_implied_gamma_flip_history(gex_history)
-    hist = _merge_series("gamma_flip", proxy_hist, hist)
+    df = _load_series_cache_with_source("gamma_flip_history.csv", "gamma_flip")
 
     _, today_val = _cboe_gamma_snapshot("SPY")
-    try:
-        if today_val is None:
-            with _silence_stderr():
-                t = yf.Ticker("SPY")
-                spot = t.info.get("regularMarketPrice", t.info.get("previousClose", 0))
-                if not spot:
-                    px_hist = t.history(period="5d")["Close"].iloc[-1]
-                    spot = float(px_hist)
-
-                # Estimate flip zone from option open interest distribution
-                all_expiries = list(t.options)
-                if not all_expiries:
-                    return hist  # Return cached/proxy data even if compute fails
-
-                # Use nearest expiry for max gamma sensitivity
-                chain = t.option_chain(all_expiries[0])
-
-                calls = chain.calls
-                puts = chain.puts
-
-                # Weighted average strike by open interest
-                call_oi = calls.get("openInterest", pd.Series(0, index=calls.index)).fillna(0)
-                put_oi = puts.get("openInterest", pd.Series(0, index=puts.index)).fillna(0)
-
-                call_oi_weighted = (calls["strike"] * call_oi).sum() / max(1, call_oi.sum())
-                put_oi_weighted = (puts["strike"] * put_oi).sum() / max(1, put_oi.sum())
-
-                # Flip zone roughly between weighted put and call strikes
-                flip_zone = (put_oi_weighted + call_oi_weighted) / 2
-
-                # Distance as % of spot
-                distance_pct = (spot - flip_zone) / spot * 100
-                today_val = distance_pct
-    except Exception as e:
-        log.info("Gamma flip zone calculation failed: %s", str(e)[:80])
-
     if today_val is not None:
-        today = pd.Timestamp.today().normalize()
-        hist.loc[today] = today_val
-        hist = hist[~hist.index.duplicated(keep="last")].sort_index()
-        _save_cache("gamma_flip_history.csv", hist, "gamma_flip")
+        stamp = last_completed_trading_day()
+        live = pd.Series([float(today_val)], index=[stamp])
+        df = _upsert_sourced_rows(df, live, "gamma_flip", "cboe_snapshot")
+        _save_series_cache_with_source("gamma_flip_history.csv", df, "gamma_flip")
 
-    hist.name = "gamma_flip"
-    return hist
+    # Display-only context for the chart: legacy mixed rows + synthetic proxy.
+    scored_mask = df["source"].isin(GAMMA_SCORED_SOURCES)
+    legacy = df.loc[~scored_mask, "gamma_flip"]
+    proxy_hist = _gex_implied_gamma_flip_history(gamma_exposure_proxy())
+    overlay = _merge_series("gamma_flip", legacy, proxy_hist)
+    if not overlay.empty:
+        _set_display_overlay("gamma_flip_zone", overlay)
+
+    out = df.loc[scored_mask, "gamma_flip"].copy()
+    out.name = "gamma_flip"
+    if out.empty:
+        record_provenance("gamma_flip_zone", "", kind="unavailable",
+                          note="no measured flip estimate; backfill is display-only")
+    elif today_val is not None:
+        record_provenance("gamma_flip_zone", "cboe_delayed_options", kind="primary",
+                          note="gamma/OI-weighted strike midpoint estimate; building history")
+    else:
+        record_provenance("gamma_flip_zone", "cache(measured rows)", kind="cache",
+                          note="no live snapshot this build")
+    return out
 
 
 def index_put_call_ratio() -> pd.Series:
@@ -1688,13 +1910,18 @@ def dxy() -> pd.Series:
         s = yf_series(sym, period="10y")
         if not s.empty:
             s.name = "dxy"
+            record_provenance(
+                "dxy", f"yfinance:{sym}",
+                kind="primary" if sym == "DX-Y.NYB" else "fallback",
+            )
             return s
+    record_provenance("dxy", "", kind="unavailable")
     return pd.Series(dtype=float, name="dxy")
 
 
 def real_yield_10y() -> pd.Series:
     """10Y TIPS real yield (FRED DFII10), in percent."""
-    s = _fred("DFII10")
+    s = _fred("DFII10", prov_key="real_yield_10y")
     s.name = "real_yield_10y"
     return s
 
