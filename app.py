@@ -1288,8 +1288,9 @@ with _m4:
 ts_marker: pd.Timestamp | None = st.session_state.ts_marker_date
 
 # Paired left<->right by theme so each row reads as a side-by-side comparison.
-# 11 charts split 6+5 — the orphan (% SP500 above 200DMA) sits at the bottom
-# of the LEFT column so any trailing empty space falls on the right (the eye
+# 13 charts split 7+6 — VIX and VVIX stack on the left (vol & vol-of-vol) above
+# the SKEW/term pairing; the orphan (% SP500 above 200DMA) sits at the bottom of
+# the LEFT column so any trailing empty space falls on the right (the eye
 # expects the left to extend further and tolerates a right-side gap better).
 rc1, rc2 = st.columns(2)
 with rc1:
@@ -1307,6 +1308,14 @@ with rc1:
         "VIX",
         ref_lines=[(13, "complacency"), (30, "fear")],
         indicator_key="vix",
+        marker_ts=ts_marker,
+    )
+    # Row 2b — vol-of-vol (VIX's own implied vol; completes the VIX·VVIX·SKEW complex)
+    _line(
+        raw.series.get("vvix"),
+        "VVIX (Vol of Vol)",
+        ref_lines=[(85, "complacency"), (130, "tail-hedging spike")],
+        indicator_key="vvix",
         marker_ts=ts_marker,
     )
     # Row 3 — cross-asset divergence (pairs with cross-asset correlation)
