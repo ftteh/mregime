@@ -1575,6 +1575,133 @@ def cftc_cta_positioning() -> pd.Series:
 
 
 # ---------------------------------------------------------------------------
+# FINRA margin debt (leverage / positioning)
+# ---------------------------------------------------------------------------
+# Monthly "Debit Balances in Customers' Securities Margin Accounts" — the
+# market's aggregate leverage. Rapid YoY expansion has marked euphoric tops
+# (2000, 2007, 2021); YoY contraction accompanies deleveraging washouts. FINRA
+# publishes it only as a Cloudflare-gated page/XLSX ("data feeds are not
+# available"), which blocks a direct runtime fetch from datacenter/shared IPs,
+# so the live feed is YCharts' public indicator page. Values there carry
+# magnitude suffixes ("1.416T", "920.96B") that the generic put/call parser
+# reads as NaN, so parse them here and normalise everything to $ billions.
+
+# Bundled fallback so a fresh cloud deploy (empty local cache) still renders the
+# chart even when YCharts is blocked on a shared IP. Real FINRA values (obtained
+# via YCharts), $ billions, month-end. Refreshed opportunistically by the live
+# feed; extend it by re-running the generator when it drifts too far behind.
+_MARGIN_DEBT_SEED: list[tuple[str, float]] = [
+    ("2022-04-30", 772.94), ("2022-05-31", 752.94), ("2022-06-30", 683.44),
+    ("2022-07-31", 696.78), ("2022-08-31", 687.79), ("2022-09-30", 664.01),
+    ("2022-10-31", 649.62), ("2022-11-30", 643.78), ("2022-12-31", 606.66),
+    ("2023-01-31", 641.23), ("2023-02-28", 624.38), ("2023-03-31", 645.43),
+    ("2023-04-30", 631.95), ("2023-05-31", 644.17), ("2023-06-30", 681.23),
+    ("2023-07-31", 709.83), ("2023-08-31", 689.18), ("2023-09-30", 680.85),
+    ("2023-10-31", 635.28), ("2023-11-30", 660.89), ("2023-12-31", 700.77),
+    ("2024-01-31", 701.98), ("2024-02-29", 742.96), ("2024-03-31", 784.14),
+    ("2024-04-30", 775.46), ("2024-05-31", 809.43), ("2024-06-30", 809.32),
+    ("2024-07-31", 810.84), ("2024-08-31", 797.16), ("2024-09-30", 813.21),
+    ("2024-10-31", 815.37), ("2024-11-30", 890.85), ("2024-12-31", 899.17),
+    ("2025-01-31", 937.25), ("2025-02-28", 918.14), ("2025-03-31", 880.32),
+    ("2025-04-30", 850.56), ("2025-05-31", 920.96), ("2025-06-30", 1008.0),
+    ("2025-07-31", 1023.0), ("2025-08-31", 1060.0), ("2025-09-30", 1126.0),
+    ("2025-10-31", 1184.0), ("2025-11-30", 1214.0), ("2025-12-31", 1226.0),
+    ("2026-01-31", 1279.0), ("2026-02-28", 1253.0), ("2026-03-31", 1221.0),
+    ("2026-04-30", 1304.0), ("2026-05-31", 1416.0),
+]
+
+
+def _parse_ycharts_magnitude(text) -> float | None:
+    """Parse a YCharts abbreviated magnitude to $ billions.
+
+    "1.416T" -> 1416.0, "920.96B" -> 920.96, "1,234M" -> 1.234. A bare number
+    is assumed to already be in billions. Returns None when no number is present.
+    """
+    m = re.search(r"(-?[0-9][0-9,]*\.?[0-9]*)\s*([TBMK])?", str(text).strip().upper())
+    if not m:
+        return None
+    try:
+        num = float(m.group(1).replace(",", ""))
+    except ValueError:
+        return None
+    return num * {"T": 1000.0, "B": 1.0, "M": 1e-3, "K": 1e-6, None: 1.0}[m.group(2)]
+
+
+def _margin_debt_seed_series() -> pd.Series:
+    """The bundled seed as a tz-naive, sorted monthly Series in $ billions."""
+    idx = pd.to_datetime([d for d, _ in _MARGIN_DEBT_SEED])
+    s = pd.Series([v for _, v in _MARGIN_DEBT_SEED], index=idx, name="margin_debt")
+    return s.sort_index()
+
+
+def _ycharts_margin_debt() -> pd.Series:
+    """FINRA margin debt ($B) from YCharts' public indicator page (no key).
+
+    YCharts renders ~50 recent months across two Date/Value tables; the values
+    use magnitude suffixes, so parse with _parse_ycharts_magnitude rather than the
+    plain-decimal path used by the put/call slugs.
+    """
+    url = "https://ycharts.com/indicators/finra_margin_debt"
+    try:
+        r = requests.get(url, headers=UA, timeout=12)
+        if not r.ok:
+            return pd.Series(dtype=float, name="margin_debt")
+        tables = pd.read_html(io.StringIO(r.text))
+    except Exception as e:
+        log.info("YCharts margin debt unavailable (%s)", str(e)[:80])
+        return pd.Series(dtype=float, name="margin_debt")
+    parts = []
+    for df in tables:
+        cols = [str(c).strip() for c in df.columns]
+        if "Date" not in cols or "Value" not in cols:
+            continue
+        tmp = df[[cols[cols.index("Date")], cols[cols.index("Value")]]].copy()
+        tmp.columns = ["date", "value"]
+        tmp["date"] = pd.to_datetime(tmp["date"], errors="coerce")
+        tmp["value"] = tmp["value"].map(_parse_ycharts_magnitude)
+        s = tmp.dropna().set_index("date")["value"]
+        if not s.empty:
+            parts.append(s)
+    return _merge_series("margin_debt", *parts)
+
+
+def finra_margin_debt() -> pd.Series:
+    """
+    FINRA margin debt — monthly "Debit Balances in Customers' Securities Margin
+    Accounts", in $ billions.
+
+    Source chain (FINRA offers no API/data-feed and Cloudflare-gates its page and
+    XLSX, so the series cannot be read from FINRA directly at runtime):
+      1. YCharts public indicator page — primary live feed (~50 recent months)
+      2. local disk cache — self-updating; survives a transient YCharts failure
+      3. bundled seed constant — guarantees the chart renders on a fresh cloud
+         deploy where the cache is empty and YCharts is blocked on a shared IP
+    Live rows override cached/seed rows for a shared month.
+    """
+    live = _ycharts_margin_debt()
+    cache = _load_series_cache("margin_debt_history.csv", "margin_debt")
+    seed = _margin_debt_seed_series()
+    merged = _merge_series("margin_debt", seed, cache, live)
+    if merged.empty:
+        record_provenance("margin_debt", "", kind="unavailable")
+        return merged
+    if not live.empty:
+        _save_series_cache("margin_debt_history.csv", merged, "margin_debt")
+        record_provenance("margin_debt", "ycharts:finra_margin_debt", kind="primary")
+    elif not cache.empty:
+        record_provenance(
+            "margin_debt", "ycharts:finra_margin_debt", kind="cache",
+            note=f"live fetch failed; cached history through {cache.index.max():%Y-%m-%d}",
+        )
+    else:
+        record_provenance(
+            "margin_debt", "bundled_seed", kind="fallback",
+            note=f"YCharts unreachable and no local cache; seed through {seed.index.max():%Y-%m-%d}",
+        )
+    return merged
+
+
+# ---------------------------------------------------------------------------
 # Yield curve
 # ---------------------------------------------------------------------------
 @_memoized_fetch

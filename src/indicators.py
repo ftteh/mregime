@@ -234,6 +234,7 @@ def build_raw() -> RawFrame:
         "move_vix_div": D.move_vs_vix_spread,
         "dix": D.dix_proxy,
         "cta_positioning": D.cftc_cta_positioning,
+        "margin_debt": D.finra_margin_debt,
         "russell2000": D.russell2000,
         "nasdaq": D.nasdaq_composite,
 

@@ -29,6 +29,7 @@ positioning, vol, and valuation — all from **free data sources**.
 - **MOVE / VIX** — when the bond market disagrees with equity vol, bonds win
 - **SPY vs (TLT+GLD) 20D correlation** — spots liquidity events ("everything selling together")
 - **DIX** — dark-pool institutional flow (when available from SqueezeMetrics)
+- **FINRA margin debt** — aggregate customer leverage; YoY growth flags euphoric tops (2000/2007/2021)
 
 **Time-series charts** for every key series with annotated reference levels.
 
@@ -96,6 +97,7 @@ Cold starts can take **1–2 minutes** (downloads breadth data). The `cache/` pu
 | **NAAIM** | Active manager exposure (weekly) | scrape programs page for current XLSX URL |
 | **yfinance options** | Put/Call computed live from SPY options chain (put vol / call vol across 3 front expiries) | daily snapshot, cached to disk |
 | **SqueezeMetrics** | DIX (dark pool index) | public CSV |
+| **YCharts** | FINRA margin debt (monthly) — FINRA's own page/XLSX is Cloudflare-gated with no data feed | public indicator page (no key); bundled seed + disk cache fallback |
 | **Wikipedia** | SP500 constituents | scraped table |
 
 All fetchers are wrapped with try/except — if one source is down, the rest of the

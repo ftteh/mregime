@@ -1591,6 +1591,36 @@ with mc2:
 
 
 # ---------------------------------------------------------------------------
+# LEVERAGE — FINRA margin debt
+# ---------------------------------------------------------------------------
+st.markdown("### Leverage — FINRA margin debt")
+st.caption(
+    "Aggregate customer **margin debt** (FINRA debit balances, monthly). The signal is the "
+    "**rate of change**, not the level: YoY expansion above +50% has marked euphoric tops "
+    "(2000, 2007, 2021), while YoY contraction accompanies deleveraging washouts. "
+    "Reported with a ~3-week lag, so the latest point trails the market."
+)
+md = raw.series.get("margin_debt", pd.Series(dtype=float))
+# YoY % change — pct_change(12) on the month-end series = year-over-year.
+md_yoy = (md.pct_change(12) * 100.0).dropna() if md is not None and not md.empty else md
+ld1, ld2 = st.columns(2)
+with ld1:
+    _line(
+        md,
+        "Margin debt ($B, month-end)",
+        marker_ts=ts_marker,
+    )
+with ld2:
+    _line(
+        md_yoy,
+        "Margin debt — YoY % change",
+        ref_lines=[(50, "euphoric leverage → top risk"), (0, "deleveraging")],
+        extra_direction="risk_high_is_top",
+        marker_ts=ts_marker,
+    )
+
+
+# ---------------------------------------------------------------------------
 # WHAT PROS WATCH — the divergences
 # ---------------------------------------------------------------------------
 st.markdown("### Pro Watchlist — divergences & confluence")
