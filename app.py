@@ -46,6 +46,8 @@ from src.config import (
     get_regime_color_for_score,
     get_regime_name_for_score,
 )
+from src import analytics as AN
+from src import charts as CH
 from src.indicators import (
     build_raw,
     cluster_signal,
@@ -123,7 +125,7 @@ def load_all():
     pillars = historical_pillar_scores(raw, per_indicator=per_ind)
     momentum = pillar_momentum(raw, pillars=pillars)
     comp_hist = historical_composite(raw, pillars=pillars)
-    return raw, scores, comp, cluster, momentum, comp_hist
+    return raw, scores, comp, cluster, momentum, comp_hist, pillars
 
 
 # ---------------------------------------------------------------------------
@@ -170,7 +172,7 @@ with st.sidebar:
 # ---------------------------------------------------------------------------
 # Load
 # ---------------------------------------------------------------------------
-raw, scores, comp, cluster, momentum, comp_hist = load_all()
+raw, scores, comp, cluster, momentum, comp_hist, pillars = load_all()
 
 # All time-series charts share this x-axis window (aligned duration)
 CHART_LOOKBACK_YEARS = 3
@@ -964,6 +966,10 @@ INDICATOR_UNITS: dict[str, str] = {
     "gamma_exposure": "$B",
     "gamma_flip_zone": "%",
     "index_put_call": "",
+    # Full-universe participation + growth valuation
+    "trend_breadth_10_20": "%",
+    "obos_spread_50d": "pp",
+    "ndx_trailing_pe": "x",
 }
 
 
@@ -979,7 +985,7 @@ def _fmt_raw_cell(row: pd.Series) -> str:
     elif key in ("copper_gold", "vix_term_9d_1m", "vix_term_1m_3m", "put_call", "index_put_call"):
         val = f"{v:.3f}"
     elif key in ("hy_spread_velocity", "aaii_bull_bear", "cta_positioning", "equity_risk_premium",
-                 "fra_ois_spread", "sofr_spread", "gamma_flip_zone"):
+                 "fra_ois_spread", "sofr_spread", "gamma_flip_zone", "obos_spread_50d"):
         val = f"{v:+,.1f}"
     elif key == "gamma_exposure":
         val = f"{v:+.2f}"
@@ -1236,6 +1242,276 @@ _render_index_regime_overlay(
     "IXIC",
     band_filter_name,
 )
+
+
+# ---------------------------------------------------------------------------
+# MARKET INTERNALS — participation, rotation, valuation
+# Full-constituent S&P 500 breadth (10/20DMA trend + 50D overbought/oversold),
+# style-rotation relative strength and Nasdaq 100 multiples. Pure math lives in
+# src.analytics, figures in src.charts — this block only lays them out.
+# ---------------------------------------------------------------------------
+_TONE_COLORS = {"pos": "#2ecc8f", "neg": "#e8615f", "neutral": "#95a5a6"}
+_BREADTH_LABEL_COLORS = {
+    "EXTENDED": "#e67e22", "BROAD": "#3cc5b0", "MIXED": "#95a5a6",
+    "NARROW": "#3498db", "WASHED OUT": "#16a085", "NO DATA": "#7f8c8d",
+}
+
+
+def _kv_rows(rows: list[tuple[str, str]]) -> str:
+    return "".join(
+        "<div style='display:flex; justify-content:space-between; align-items:baseline; "
+        "padding:6px 0; border-bottom:1px solid rgba(255,255,255,0.06);'>"
+        f"<span style='color:#9aa4ad; font-size:0.7rem; letter-spacing:0.6px;'>{k}</span>"
+        f"<b style='font-size:0.92rem; color:#fff;'>{v}</b></div>"
+        for k, v in rows
+    )
+
+
+def _kpi_strip(items: list[tuple[str, str, str]]) -> str:
+    """Horizontal KPI strip: (label, value, color) triples."""
+    cells = "".join(
+        "<div style='flex:1 1 auto; padding:4px 22px 4px 0;'>"
+        f"<div style='color:#9aa4ad; font-size:0.68rem; letter-spacing:0.8px; font-weight:600; white-space:nowrap;'>{lbl}</div>"
+        f"<div style='color:{col}; font-size:{'1.55rem' if len(val) <= 10 else '1.15rem'}; font-weight:800; "
+        f"line-height:1.6; white-space:nowrap;'>{val}</div></div>"
+        for lbl, val, col in items
+    )
+    return f"<div style='display:flex; flex-wrap:wrap; gap:6px; margin:2px 0 6px 0;'>{cells}</div>"
+
+
+def _source_line(*keys: str) -> str:
+    """'Source: …' footer from this build's provenance (flags cache / seed fallbacks)."""
+    parts = []
+    for key in keys:
+        prov = (raw.meta.get(key, {}) or {}).get("provenance") or {}
+        kind, src = prov.get("kind"), prov.get("source") or ""
+        if kind == "unavailable" or not src:
+            parts.append(f"{key}: offline")
+            continue
+        badge = {"cache": " (cached — live fetch failed)",
+                 "fallback": " (⚠ bundled seed — live source unreachable)",
+                 "proxy": " (⚠ proxy)"}.get(kind, "")
+        parts.append(f"{src}{badge}")
+    return " · ".join(dict.fromkeys(parts))
+
+
+def _fmt_pct_rank(p: float) -> str:
+    return "—" if p is None or np.isnan(p) else f"{p:.0f}"
+
+
+# ---- 1. Short-term trend breadth (10DMA > 20DMA) --------------------------
+st.markdown("### Participation — S&P 500 short-term trend breadth")
+st.caption(
+    "Share of **all current S&P 500 constituents** whose 10-day moving average is above their "
+    "20-day, equal-weighted across eligible securities. **>80% = extended thrust**, "
+    "**<20% = washout**, 50 = neutral. Upper panel: the index against its 200DMA for context."
+)
+_tb = raw.series.get("trend_breadth_10_20", pd.Series(dtype=float))
+if _tb is None or _tb.empty:
+    st.info("Trend breadth unavailable — S&P constituent download failed and no cached / seed history.")
+else:
+    _tb_frame = pd.DataFrame({
+        "pct": _tb,
+        "eligible": raw.series.get("trend_breadth_eligible", pd.Series(dtype=float)),
+    }).dropna(subset=["pct"])
+    _spx_px = raw.series.get("spx", pd.Series(dtype=float))
+    _tbs = AN.trend_breadth_snapshot(_tb_frame, _spx_px, lookback_years=3)
+    _c_fig, _c_snap = st.columns([3.3, 1])
+    with _c_fig:
+        st.plotly_chart(
+            CH.trend_breadth_figure(_tb, _spx_px, CHART_START, index_name="S&P 500", marker_ts=ts_marker),
+            width="stretch",
+        )
+    with _c_snap:
+        _lab_col = _BREADTH_LABEL_COLORS.get(_tbs.get("label"), "#95a5a6")
+        _spx_vs = _tbs.get("index_vs_200dma", np.nan)
+        # Built outside the f-string: nested same-type quotes inside f-strings
+        # are a SyntaxError before Python 3.12 (the devcontainer runs 3.11).
+        _snap_rows = _kv_rows([
+            ("3Y HISTORICAL %ILE", _fmt_pct_rank(_tbs.get("pct_rank"))),
+            ("VS. NEUTRAL (50)", f"{_tbs['vs_neutral']:+.1f} pts"),
+            ("SPX VS 200DMA", "—" if np.isnan(_spx_vs) else f"{_spx_vs:+.1f}%"),
+            ("ELIGIBLE STOCKS", "—" if _tbs.get("eligible") is None else f"{_tbs['eligible']}"),
+        ])
+        st.markdown(
+            f"""
+<div class='card' style='min-height:560px;'>
+  <div style='color:#9aa4ad; font-size:0.72rem; letter-spacing:1px; font-weight:700;'>RESEARCH SNAPSHOT</div>
+  <div style='color:#9aa4ad; font-size:0.7rem; letter-spacing:0.8px; margin-top:14px;'>10 / 20DMA BREADTH</div>
+  <div style='color:#3cc5b0; font-size:2.9rem; font-weight:800; line-height:1.1;'>{_tbs['current']:.1f}%</div>
+  <div style='color:#9aa4ad; font-size:0.68rem;'>CURRENT READING · {_tbs['as_of']:%d %b %Y}</div>
+  <div style='color:{_lab_col}; font-size:1.15rem; font-weight:800; margin:14px 0 10px 0;'>{_tbs['label']}</div>
+  {_snap_rows}
+  <div style='color:#9aa4ad; font-size:0.7rem; letter-spacing:0.8px; margin-top:14px;'>SIGNAL LENS</div>
+  <div style='color:#ddd; font-size:0.85rem; margin-top:4px; line-height:1.4;'>{_tbs['lens']}</div>
+</div>
+""",
+            unsafe_allow_html=True,
+        )
+    st.caption(f"Source: {_source_line('trend_breadth_10_20')}. Current constituents (survivorship bias).")
+
+
+# ---- 2. Overbought / oversold vs 50-day band ------------------------------
+st.markdown("### Participation — S&P 500 overbought / oversold (50-day bands)")
+st.caption(
+    "A constituent is **overbought** when its close is more than **1σ above** its 50-day average and "
+    "**oversold** when more than 1σ below (σ = 50-day rolling std of price). Spread = OB% − OS%. "
+    "Shaded zones = the spread's own top / bottom 15% over ~5 years of history. Last 12 months shown."
+)
+_obos = pd.DataFrame({
+    "spread": raw.series.get("obos_spread_50d", pd.Series(dtype=float)),
+    "ob_pct": raw.series.get("obos_ob_pct", pd.Series(dtype=float)),
+    "os_pct": raw.series.get("obos_os_pct", pd.Series(dtype=float)),
+}).dropna(subset=["spread"])
+if _obos.empty:
+    st.info("Overbought / oversold breadth unavailable — no live, cached or seed history.")
+else:
+    _os = AN.obos_snapshot(_obos)
+    _state_col = {"OVERBOUGHT ZONE": "#e8615f", "OVERSOLD ZONE": "#2ecc8f"}.get(_os["state"], "#c9d1d9")
+    st.markdown(
+        _kpi_strip([
+            ("OB − OS SPREAD", f"{_os['spread']:+.1f} pp", "#5da9e9"),
+            ("OVERBOUGHT", f"{_os['ob']:.1f}%", "#e8615f"),
+            ("OVERSOLD", f"{_os['os']:.1f}%", "#2ecc8f"),
+            ("STATE", _os["state"], _state_col),
+            ("5Y %ILE OF SPREAD", _fmt_pct_rank(_os["pct_rank"]), "#c9d1d9"),
+        ]),
+        unsafe_allow_html=True,
+    )
+    _obos_start = CHART_END - pd.DateOffset(years=1)
+    st.plotly_chart(
+        CH.obos_figure(_obos, _obos_start, _os["zone_lo"], _os["zone_hi"], marker_ts=ts_marker),
+        width="stretch",
+    )
+    st.caption(
+        f"{_os['note']} Zones: oversold ≤ {_os['zone_lo']:+.1f}, overbought ≥ {_os['zone_hi']:+.1f}. "
+        f"Source: {_source_line('obos_spread_50d')}."
+    )
+
+
+# ---- 3. Style rotation — relative strength --------------------------------
+@st.cache_data(ttl=60 * 60, show_spinner=False)
+def _lazy_px(ticker: str) -> pd.Series:
+    """Cheap one-off price fetch for rotation pairs not in the main build."""
+    from src import data as _D
+    return _D.yf_series(ticker, period="5y")
+
+
+RS_PAIRS: dict[str, tuple[str, str, str, str]] = {
+    # label: (numerator, denominator, short name, how to read)
+    "IWM / SPX — small caps vs S&P 500": (
+        "russell2000", "spx", "IWM / SPX",
+        "Rising = small caps leading (risk appetite broadening); falling = mega-cap concentration / growth worries."),
+    "RSP / SPY — equal-weight vs cap-weight": (
+        "RSP", "SPY", "RSP / SPY",
+        "Rising = the average stock is keeping up (broad market); falling = narrow, mega-cap-led tape."),
+    "QQQ / SPY — Nasdaq 100 vs S&P 500": (
+        "QQQ", "SPY", "QQQ / SPY",
+        "Rising = growth / tech leadership; falling = rotation toward value, cyclicals or defensives."),
+    "XLY / XLP — discretionary vs staples": (
+        "XLY", "XLP", "XLY / XLP",
+        "Rising = consumers / risk-on leading; falling = defensive rotation (classic late-cycle tell)."),
+}
+
+
+def _rs_leg(code: str) -> pd.Series:
+    if code == "spx":
+        return raw.series.get("spx", pd.Series(dtype=float))
+    if code == "russell2000":
+        s = _index_series("russell2000")
+        return s if s is not None and not s.empty else _lazy_px("IWM")
+    return _lazy_px(code)
+
+
+st.markdown("### Style rotation — relative strength")
+_rs_c1, _rs_c2 = st.columns([2.4, 1])
+with _rs_c1:
+    _pair_label = st.selectbox("Pair", list(RS_PAIRS), index=0, key="rs_pair")
+with _rs_c2:
+    _rs_win = st.radio("Window", ["6M", "1Y", "3Y"], index=1, horizontal=True, key="rs_window")
+_num_code, _den_code, _pair_short, _pair_read = RS_PAIRS[_pair_label]
+_rs = AN.relative_strength(_rs_leg(_num_code), _rs_leg(_den_code), fast=50, slow=200)
+if _rs.empty or _rs["ratio"].dropna().empty:
+    st.info(f"{_pair_short}: price data unavailable for one leg of the pair.")
+else:
+    _rs_start = CHART_END - pd.DateOffset(months={"6M": 6, "1Y": 12, "3Y": 36}[_rs_win])
+    _rs_rb = AN.rebase_to(_rs, _rs_start)
+    _rs_status = AN.relative_strength_status(_rs)
+    _st_col = _TONE_COLORS.get(_rs_status.get("tone"), "#95a5a6")
+    _asof = _rs["ratio"].dropna().index[-1]
+    st.markdown(
+        f"<div style='display:flex; justify-content:space-between; align-items:baseline; flex-wrap:wrap;'>"
+        f"<div style='font-size:1.25rem; font-weight:800; color:#fff;'>{_pair_short} &nbsp;|&nbsp; RELATIVE STRENGTH"
+        f"<span class='sub' style='font-size:0.8rem; font-weight:400; margin-left:10px;'>STYLE ROTATION MONITOR</span></div>"
+        f"<div style='text-align:right;'><span class='sub'>AS OF {_asof:%d %b %Y}</span>&nbsp;&nbsp;"
+        f"<span class='pill' style='background:{_st_col};'>{_rs_status['label']}</span></div></div>"
+        f"<div class='sub' style='margin-top:2px;'>{_rs_status.get('detail', '')}</div>",
+        unsafe_allow_html=True,
+    )
+    st.plotly_chart(CH.relative_strength_figure(_rs_rb, _pair_short, marker_ts=ts_marker), width="stretch")
+    st.caption(
+        f"{_pair_read} Ratio rebased to 100 at the first observation of the window; "
+        "50D / 200D moving averages of the ratio are computed on full history. "
+        "Stacking: ratio > 50D > 200D = relative strength, ratio < 50D < 200D = relative weakness."
+    )
+
+
+# ---- 4. Valuation — Nasdaq 100 forward & trailing P/E ---------------------
+st.markdown("### Valuation — Nasdaq 100 multiples")
+_fwd = raw.series.get("ndx_forward_pe", pd.Series(dtype=float))
+_trl = raw.series.get("ndx_trailing_pe", pd.Series(dtype=float))
+if (_fwd is None or _fwd.empty) and (_trl is None or _trl.empty):
+    st.info("Nasdaq 100 valuation unavailable — VCP Scanner / WorldPERatio unreachable and no cached / seed history.")
+else:
+    _fs = AN.valuation_stats(_fwd, years=5) if _fwd is not None and not _fwd.empty else {}
+    _ts = AN.valuation_stats(_trl, years=5) if _trl is not None and not _trl.empty else {}
+    _kpis: list[tuple[str, str, str]] = []
+    if _fs:
+        _span_lbl = (f"{_fs['span_years'] * 12:.0f}M" if _fs["span_years"] < 1 else f"{_fs['span_years']:.1f}Y")
+        _kpis += [
+            ("CURRENT FWD P/E", f"{_fs['current']:.1f}x", "#5da9e9"),
+            (f"FWD %ILE ({_span_lbl} HISTORY)", f"{_fs['pct_rank']:.0f}%", "#5da9e9"),
+        ]
+    if _ts:
+        _kpis += [
+            ("TRAILING P/E", f"{_ts['current']:.1f}x", "#2ecc8f"),
+            ("5Y PERCENTILE", f"{_ts['pct_rank']:.0f}%", "#2ecc8f"),
+            ("VS 5Y AVG", f"{_ts['vs_avg_pct']:+.0f}%", "#2ecc8f"),
+        ]
+    st.markdown(_kpi_strip(_kpis), unsafe_allow_html=True)
+    st.plotly_chart(
+        CH.valuation_figure(
+            _trl, _fwd, CHART_END - pd.DateOffset(years=5),
+            trailing_avg=_ts.get("avg") if _ts else None,
+            forward_avg=_fs.get("avg") if _fs else None,
+            marker_ts=ts_marker,
+        ),
+        width="stretch",
+    )
+    _head = _ts or _fs
+    if _head:
+        _band = (f"bottom {_head['pct_rank']:.0f}%" if _head["pct_rank"] <= 50
+                 else f"top {100 - _head['pct_rank']:.0f}%")
+        _which = "trailing" if _ts else "forward"
+        _tone_col = _TONE_COLORS.get(_head["tone"], "#c9d1d9")
+        _fwd_txt = ""
+        if _fs and _ts:
+            _fwd_txt = (f" Forward P/E {_fs['current']:.1f}x sits at the {_fs['pct_rank']:.0f}th percentile of its "
+                        f"{_span_lbl} free history (avg {_fs['avg']:.1f}x).")
+        st.markdown(
+            f"<div style='color:{_tone_col}; font-weight:800; font-size:1.0rem; letter-spacing:0.4px;'>"
+            f"{_head['headline']}</div>"
+            f"<div class='sub' style='font-size:0.9rem;'>Nasdaq 100 {_which} multiple is in the {_band} of its "
+            f"{min(_head['span_years'], 5):.0f}-year range ({_head['vs_avg_pct']:+.0f}% vs its {_head['avg']:.1f}x "
+            f"average, z {_head['z']:+.1f}σ).{_fwd_txt}</div>",
+            unsafe_allow_html=True,
+        )
+    st.caption(
+        "Forward = next-12-month consensus, bottom-up (VCP Scanner; free daily history starts Mar 2026 and "
+        "accumulates locally each build). Trailing = QQQ-basis P/E (WorldPERatio; monthly since 1990, latest point "
+        "live) — supplies the 5-year perspective and feeds the Valuation pillar. Bloomberg's BEst forward P/E is "
+        f"paid; levels differ by methodology. Source: {_source_line('ndx_forward_pe', 'ndx_trailing_pe')}."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1618,6 +1894,147 @@ with ld2:
         extra_direction="risk_high_is_top",
         marker_ts=ts_marker,
     )
+
+
+# ---------------------------------------------------------------------------
+# STANDARDIZED SIGNALS — every series as a rolling 1-year z-score
+# Surfaces which signals sit at a statistical extreme vs their OWN recent
+# history (complements the percentile-based cluster detector, which ranks vs
+# 3 years). Point-in-time: each day is scored against its trailing 252 sessions.
+# ---------------------------------------------------------------------------
+_EXTRA_SIGNALS: list[tuple[str, str, str | None]] = [
+    # key in raw.series, label, orientation (None = no top/bottom reading)
+    ("ndx_forward_pe", "Nasdaq 100 Forward P/E", "risk_high_is_top"),
+    ("obos_ob_pct", "% S&P 500 Overbought (50D band)", "risk_high_is_top"),
+    ("obos_os_pct", "% S&P 500 Oversold (50D band)", "contrarian_high_is_top"),
+    ("dix", "Dark Pool Index (DIX)", "contrarian_high_is_top"),
+    ("corr_cluster", "SPY vs (TLT+GLD) 20D correlation", "contrarian_high_is_top"),
+    ("move_vix_div", "MOVE / VIX ratio", None),
+]
+
+
+def _signal_candidates() -> list[tuple[str, str, pd.Series, str | None]]:
+    out: list[tuple[str, str, pd.Series, str | None]] = []
+    for spec in INDICATORS:
+        s = raw.series.get(spec.key)
+        if s is not None and not s.empty:
+            out.append((spec.key, spec.label, s, spec.direction))
+    for key, label, direction in _EXTRA_SIGNALS:
+        s = raw.series.get(key)
+        if s is not None and not s.empty:
+            out.append((key, label, s, direction))
+    md_s = raw.series.get("margin_debt", pd.Series(dtype=float))
+    if md_s is not None and len(md_s) > 13:
+        out.append(("margin_debt_yoy", "Margin debt YoY %", (md_s.pct_change(12) * 100).dropna(),
+                    "risk_high_is_top"))
+    rut, spx_ = raw.series.get("russell2000"), raw.series.get("spx")
+    if rut is not None and spx_ is not None and not rut.empty and not spx_.empty:
+        out.append(("iwm_spx_ratio", "IWM / SPX relative strength",
+                    AN.relative_strength(rut, spx_)["ratio"], None))
+    if comp_hist is not None and not comp_hist.empty:
+        out.append(("composite", "Composite regime score", comp_hist, "risk_high_is_top"))
+    if pillars is not None and not pillars.empty:
+        for bkey in pillars.columns:
+            out.append((f"pillar_{bkey}", f"{pillar_names.get(bkey, bkey)} pillar",
+                        pillars[bkey].dropna(), "risk_high_is_top"))
+    return out
+
+
+@st.cache_data(ttl=60 * 60, show_spinner=False)
+def _standardized_scan(fingerprint: str, _cands: list) -> tuple[pd.DataFrame, dict]:
+    """z-score every candidate once per data build (`fingerprint` keys the cache;
+    `_cands` is excluded from hashing)."""
+    rows, results = [], {}
+    for key, label, series, direction in _cands:
+        r = AN.standardize_signal(series)
+        if not r:
+            continue
+        # Signal name under "name": r already carries "label" (the z-state text).
+        results[key] = {**r, "name": label, "direction": direction}
+        rows.append({
+            "key": key,
+            "Signal": label,
+            "Latest": r["latest_raw"],
+            "1Y z": round(r["latest_z"], 2),
+            "1Y %ile": round(r["pct_1y"], 1),
+            "State": r["label"].replace("AT A ", "").title(),
+            "Reads as": AN.oriented_extreme(r["latest_z"], direction),
+            "As of": f"{pd.Timestamp(r['as_of']):%Y-%m-%d}",
+        })
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.reindex(df["1Y z"].abs().sort_values(ascending=False).index).reset_index(drop=True)
+    return df, results
+
+
+st.markdown("### Standardized signals — 1-year z-scores")
+st.caption(
+    "Each signal re-expressed as a **rolling 1-year z-score** (each day vs its own trailing 252 sessions — "
+    "no look-ahead) plus the **1-year percentile** of today's value. |z| ≥ 2 = statistical extreme vs its "
+    "own recent history. *Reads as* maps the sign through the indicator's top/bottom orientation "
+    "(e.g. a +3σ VIX reads as a bottom-setup extreme). Default selection = the most extreme signal today."
+)
+_cands = _signal_candidates()
+_fp = "|".join(
+    f"{k}:{len(s)}:{s.index[-1]}:{float(s.iloc[-1]):.6g}" for k, _, s, _ in _cands if len(s)
+)
+_scan, _zres = _standardized_scan(_fp, _cands)
+if _scan.empty:
+    st.info("Not enough history to standardize any signal yet.")
+else:
+    _keys = _scan["key"].tolist()
+    _sel = st.selectbox(
+        "Signal", _keys, index=0, key="zsignal_select",
+        format_func=lambda k: f"{_zres[k]['name']}  ({_zres[k]['latest_z']:+.1f}σ)",
+    )
+    _r = _zres[_sel]
+    _z_col = "#2ecc8f" if _r["latest_z"] >= 0 else "#e8615f"
+    _pct_col = "#e8615f" if _r["pct_1y"] <= 10 else ("#2ecc8f" if _r["pct_1y"] >= 90 else "#c9d1d9")
+    _hdr_l, _hdr_r = st.columns([2.2, 1.3])
+    with _hdr_l:
+        st.markdown(
+            f"<div style='color:#9aa4ad; font-size:0.75rem; letter-spacing:1px; font-weight:700;'>"
+            f"{_r['name'].upper()} · 1-YEAR RANGE · Z-SCORE VIEW</div>"
+            f"<div style='font-size:1.35rem; font-weight:800; color:#fff; line-height:1.25;'>"
+            f"STANDARDIZED SIGNAL {AN.zscore_label(_r['latest_z'])}</div>",
+            unsafe_allow_html=True,
+        )
+    with _hdr_r:
+        st.markdown(
+            _kpi_strip([
+                ("1Y PERCENTILE", f"{_r['pct_1y']:.1f}%", _pct_col),
+                ("LATEST", f"{_r['latest_z']:+.1f}σ", _z_col),
+            ]),
+            unsafe_allow_html=True,
+        )
+    st.plotly_chart(CH.zscore_figure(_r["z"], _r["name"], marker_ts=ts_marker), width="stretch")
+    _reads = AN.oriented_extreme(_r["latest_z"], _r["direction"])
+    st.markdown(
+        f"<div style='color:#2ecc8f; font-weight:800; letter-spacing:0.5px;'>TAKEAWAY</div>"
+        f"<div class='sub' style='font-size:0.9rem;'>{_r['takeaway']}"
+        + ("" if _reads in ("—", "neutral") else f" In this dashboard's orientation that reads as a <b>{_reads}</b>.")
+        + "</div>",
+        unsafe_allow_html=True,
+    )
+
+    def _z_style(v):
+        if not isinstance(v, (int, float)) or pd.isna(v):
+            return ""
+        if v >= 2:
+            return "background-color: rgba(46,204,143,0.35);"
+        if v <= -2:
+            return "background-color: rgba(232,97,95,0.40);"
+        if abs(v) >= 1:
+            return "background-color: rgba(255,255,255,0.08);"
+        return ""
+
+    with st.expander(f"Extremes scanner — {int((_scan['1Y z'].abs() >= 2).sum())} signals at |z| ≥ 2 "
+                     f"({len(_scan)} scanned)", expanded=False):
+        st.dataframe(
+            _scan.drop(columns=["key"]).style.map(_z_style, subset=["1Y z"]).format(
+                {"Latest": "{:,.4g}", "1Y z": "{:+.2f}", "1Y %ile": "{:.1f}"}),
+            width="stretch", hide_index=True, height=420,
+        )
 
 
 # ---------------------------------------------------------------------------

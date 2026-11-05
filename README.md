@@ -21,15 +21,27 @@ positioning, vol, and valuation — all from **free data sources**.
 | Pillar | Weight | What it measures |
 |---|---|---|
 | Credit & Liquidity | 40% | HY/IG spreads, MOVE, Fed Net Liquidity (WALCL−TGA−RRP), NFCI |
-| Breadth & Momentum | 30% | % above 200DMA, new highs−lows, A/D line, SPX RSI |
+| Breadth & Momentum | 30% | % above 200DMA, new highs−lows, A/D line, SPX RSI, 10/20DMA trend breadth, 50D overbought−oversold spread |
 | Sentiment & Positioning | 20% | AAII, NAAIM, F&G, Put/Call, VIX, VVIX, SKEW |
-| Valuation | 10% | Equity Risk Premium |
+| Valuation | 10% | Equity Risk Premium, Nasdaq 100 trailing P/E |
 
 **Pro Watchlist** — the divergences that matter:
 - **MOVE / VIX** — when the bond market disagrees with equity vol, bonds win
 - **SPY vs (TLT+GLD) 20D correlation** — spots liquidity events ("everything selling together")
 - **DIX** — dark-pool institutional flow (when available from SqueezeMetrics)
 - **FINRA margin debt** — aggregate customer leverage; YoY growth flags euphoric tops (2000/2007/2021)
+
+**Market internals** — research-grade panels:
+- **Short-term trend breadth** — % of all S&P 500 constituents with 10DMA > 20DMA, under the index and its
+  200DMA, with a research snapshot (3Y percentile, vs neutral, SPX vs 200DMA, eligible stocks, signal lens)
+- **Overbought / oversold breadth** — share of constituents >1σ above / below their own 50-day band
+  (σ = 50D rolling std of price) and the OB−OS spread, with adaptive extreme zones
+- **Style rotation** — relative strength (IWM/SPX default; RSP/SPY, QQQ/SPY, XLY/XLP) rebased to 100 with
+  50D / 200D ratio MAs and a strength / weakness / improving / fading read
+- **Nasdaq 100 valuation** — forward P/E (consensus, daily) and trailing P/E (5-year perspective):
+  percentile, vs 5Y average, "N-year lows/highs" headline
+- **Standardized signals** — every series as a rolling 1-year z-score with 1Y percentile, a signed-fill chart
+  and an extremes scanner (|z| ≥ 2), oriented into top-risk / bottom-setup language
 
 **Time-series charts** for every key series with annotated reference levels.
 
@@ -99,9 +111,14 @@ Cold starts can take **1–2 minutes** (downloads breadth data). The `cache/` pu
 | **SqueezeMetrics** | DIX (dark pool index) | public CSV |
 | **YCharts** | FINRA margin debt (monthly) — FINRA's own page/XLSX is Cloudflare-gated with no data feed | public indicator page (no key); bundled seed + disk cache fallback |
 | **Wikipedia** | SP500 constituents | scraped table |
+| **VCP Scanner** | Nasdaq 100 forward P/E (bottom-up consensus, daily since 2026-03) | public page, Next.js payload (no key); disk cache + committed seed |
+| **WorldPERatio** | Nasdaq 100 trailing P/E (QQQ basis, monthly since 1990 + live point) | public page (no key); disk cache + committed seed |
 
 All fetchers are wrapped with try/except — if one source is down, the rest of the
-dashboard still works.
+dashboard still works. The newer panels (participation breadth, Nasdaq 100 P/E) follow
+**live → local disk cache → committed seed** (`src/seeds/*.csv`), because `cache/` is
+gitignored and ephemeral on Streamlit Cloud. Refresh the seeds occasionally with
+`python -m scripts.refresh_seeds`. The UI flags when a panel is served from cache or seed.
 
 ---
 
@@ -141,8 +158,11 @@ quant/
 ├── README.md
 └── src/
     ├── config.py          # Indicator specs, bucket weights, regime thresholds
-    ├── data.py            # All data fetchers (FRED, yfinance, scrapers)
-    └── indicators.py      # Percentile/z-score engine, composite scorer
+    ├── data.py            # All data fetchers (FRED, yfinance, scrapers) + fallback chains
+    ├── indicators.py      # Percentile/z-score engine, composite scorer
+    ├── analytics.py       # Pure math: breadth, OB/OS, relative strength, valuation stats, z-scores
+    ├── charts.py          # Plotly builders for the market-internals / z-score panels
+    └── seeds/             # Committed fallback history (regenerate: python -m scripts.refresh_seeds)
 ```
 
 ## Extending
@@ -157,7 +177,11 @@ quant/
 - **MOVE Index**: proprietary (ICE BofAML). We proxy with scaled TLT 20-day realized vol.
   For the real series, add an ICE subscription or scrape `markets.ft.com/data/indices/tearsheet/summary?s=MOVE:IOM`.
 - **Put/Call**: CBOE rotates their free CSV URLs occasionally — may need a minor patch.
-- **Breadth**: computed on a 150-ticker sample of SP500 (by market cap order) for speed.
-  Correlates >0.97 with full-index breadth.
+- **Breadth**: computed across all ~503 current S&P 500 constituents (one 5-year bulk download,
+  ~15s), equal-weighted. Uses current membership, so history carries survivorship bias.
+- **Nasdaq 100 forward P/E**: Bloomberg's BEst series is paid. The free forward history (VCP Scanner)
+  only starts in Mar 2026 and accumulates locally, so its percentile is labelled with its true span;
+  the 5-year perspective and the scored valuation input use the trailing P/E (WorldPERatio, QQQ basis).
+  Levels differ from Bloomberg by methodology.
 - **ERP**: simplified constant earnings-yield proxy. For true Damodaran ERP, ingest
   his monthly spreadsheet from NYU Stern.

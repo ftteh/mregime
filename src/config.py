@@ -297,6 +297,45 @@ INDICATORS: list[IndicatorSpec] = [
         description="Institutions hedge portfolios with index puts (not equity puts). Spike = panic hedging by smart money. Extreme spike then rapid drop = hedges monetized = bottom. Down-weighted: shares the put/call theme with the equity ratio.",
         weight=0.5,
     ),
+
+    # 13. Full-universe participation breadth (breadth & momentum pillar)
+    IndicatorSpec(
+        key="trend_breadth_10_20", label="% S&P 500 with 10DMA > 20DMA",
+        bucket="breadth_momentum", source="yfinance:all S&P 500 constituents",
+        direction="risk_high_is_top",
+        description=(
+            "Short-term trend breadth: share of current S&P 500 constituents whose 10-day "
+            ">20-day moving average, equal-weighted. >80% = extended thrust (top risk short-term), "
+            "<20% = washed out (bottom setup). Down-weighted: fast oscillator, shares the "
+            "breadth-oscillator theme with the 50D OB/OS spread."
+        ),
+        weight=0.5,
+    ),
+    IndicatorSpec(
+        key="obos_spread_50d", label="50D Overbought − Oversold Breadth (pp)",
+        bucket="breadth_momentum", source="yfinance:all S&P 500 constituents",
+        direction="risk_high_is_top",
+        description=(
+            "Share of constituents >1σ above their 50-day average (overbought) minus share >1σ "
+            "below (oversold), σ = 50D rolling std of price. Upper-tail spread = stretched breadth "
+            "(top risk), lower tail = washout (bottom setup). Down-weighted: shares the "
+            "breadth-oscillator theme with 10/20DMA breadth."
+        ),
+        weight=0.5,
+    ),
+
+    # 14. Growth-equity valuation (valuation pillar)
+    IndicatorSpec(
+        key="ndx_trailing_pe", label="Nasdaq 100 Trailing P/E",
+        bucket="valuation", source="worldperatio.com (QQQ basis)",
+        direction="risk_high_is_top",
+        description=(
+            "Nasdaq 100 trailing P/E (QQQ), monthly history since 1990 with a live latest point. "
+            "High vs its own 3y history = expensive growth equities (top risk); low = valuation reset "
+            "(bottom setup). Adds a direct multiple to the valuation pillar alongside the rates-relative ERP. "
+            "Forward P/E is charted but not scored until its free history is long enough."
+        ),
+    ),
 ]
 
 INDICATORS_BY_KEY = {i.key: i for i in INDICATORS}
@@ -325,6 +364,8 @@ INDICATOR_THEMES: dict[str, str] = {
     "hy_spread_velocity": "credit_spread",
     "fra_ois_spread": "funding_stress",
     "sofr_spread": "funding_stress",
+    "trend_breadth_10_20": "breadth_oscillator",
+    "obos_spread_50d": "breadth_oscillator",
 }
 
 

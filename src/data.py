@@ -39,6 +39,7 @@ def _silence_stderr():
     except Exception:
         yield
 
+from . import analytics as A
 from .config import FRED_API_KEY, NASDAQ_DATA_LINK_API_KEY
 
 log = logging.getLogger(__name__)
@@ -513,23 +514,27 @@ def sp500_tickers() -> list[str]:
 @_memoized_fetch
 def _sp500_close_panel() -> pd.DataFrame:
     """
-    Download daily closes for the largest S&P names once and share the result.
+    Daily closes for ALL current S&P 500 constituents (~503) over 5 years,
+    downloaded once per build and shared by every breadth consumer.
 
-    breadth_pct_above_200dma (120), new_highs_minus_lows (150) and the A/D-line
-    proxy (100) all operate on the top-N most liquid constituents over a 2y
-    window. Fetching the 150-name / 2y superset a single time and slicing it by
-    ticker name lets every consumer reuse one bulk download instead of issuing
-    three overlapping ones — the dominant cold-load network cost.
+    Breadth is equal-weighted across eligible securities, so the full
+    constituent list matters: the old panel used the first 150 rows of the
+    Wikipedia table — which is ordered by company NAME, not market cap — over
+    2 years, so "% above 200DMA" really had ~1y of history and a sample biased
+    to names starting A–E. The 5y window gives the 200DMA / 52-week-high
+    measures a genuine 3-year percentile history.
 
-    Columns are constituent tickers (insertion-ordered to match sp500_tickers);
-    the index is tz-naive daily. Returns an empty frame if the download fails.
+    One bulk `yf.download` (~15s for 503 x 5y) feeds % above 200DMA, net new
+    highs, the A/D proxy, 10/20DMA trend breadth and the 50D OB/OS spread.
+    Columns are tickers (sp500_tickers order); index is tz-naive daily.
+    Returns an empty frame if the download fails.
     """
-    tickers = sp500_tickers()[:150]
+    tickers = sp500_tickers()
     try:
         with _silence_stderr():
             df = yf.download(
                 tickers,
-                period="2y",
+                period="5y",
                 auto_adjust=False,
                 progress=False,
                 group_by="ticker",
@@ -538,9 +543,14 @@ def _sp500_close_panel() -> pd.DataFrame:
     except Exception as e:
         log.error("yf.download S&P panel failed: %s", e)
         return pd.DataFrame()
+    if df is None or df.empty:
+        return pd.DataFrame()
 
     closes = {}
+    lvl0 = set(df.columns.get_level_values(0)) if isinstance(df.columns, pd.MultiIndex) else set()
     for t in tickers:
+        if t not in lvl0:
+            continue
         try:
             closes[t] = df[t]["Close"]
         except Exception:
@@ -551,38 +561,36 @@ def _sp500_close_panel() -> pd.DataFrame:
     panel = pd.DataFrame(closes)
     if getattr(panel.index, "tz", None) is not None:
         panel.index = panel.index.tz_localize(None)
+    panel = panel.dropna(how="all", axis=1).dropna(how="all", axis=0)
     return panel
 
 
-def _panel_columns(sample_size: int) -> tuple[pd.DataFrame, list[str]]:
-    """Return the shared close panel and the present top-`sample_size` tickers.
+def _panel_columns(sample_size: int | None = None) -> tuple[pd.DataFrame, list[str]]:
+    """Return the shared close panel and the tickers to use.
 
-    Selecting by ticker name (not positional slice) reproduces the original
-    per-function behavior, which iterated `tickers[:sample_size]` and kept only
-    those that downloaded successfully.
+    `sample_size=None` (default) = every constituent that downloaded. An int
+    keeps the first N in sp500_tickers() order (legacy/testing only).
     """
     panel = _sp500_close_panel()
     if panel.empty:
         return panel, []
-    wanted = [t for t in sp500_tickers()[:sample_size] if t in panel.columns]
+    universe = sp500_tickers() if sample_size is None else sp500_tickers()[:sample_size]
+    wanted = [t for t in universe if t in panel.columns]
     return panel, wanted
 
 
-def breadth_pct_above_200dma(sample_size: int = 120) -> pd.Series:
+def breadth_pct_above_200dma(sample_size: int | None = None) -> pd.Series:
     """
-    Compute % of a sample of SP500 above their 200-day MA over time.
-    Returns a daily series.
-
-    We use a sample (default 120 largest) for speed; correlation with full-index
-    breadth is >0.97 empirically.
+    % of S&P 500 constituents above their 200-day MA over time (daily),
+    equal-weighted across every constituent with a defined 200DMA.
     """
     panel, wanted = _panel_columns(sample_size)
     if not wanted:
         record_provenance("pct_above_200dma", "", kind="unavailable")
         return pd.Series(dtype=float, name="pct_above_200dma")
     record_provenance(
-        "pct_above_200dma", f"sp500_sample_panel(top {len(wanted)})", kind="computed",
-        note="current-membership sample (survivorship); >0.97 corr w/ full index",
+        "pct_above_200dma", f"sp500_panel({len(wanted)} constituents)", kind="computed",
+        note="current membership (survivorship bias)",
     )
 
     close_df = panel[wanted].ffill()
@@ -595,15 +603,15 @@ def breadth_pct_above_200dma(sample_size: int = 120) -> pd.Series:
     return pct.dropna()
 
 
-def new_highs_minus_lows(sample_size: int = 150) -> pd.Series:
-    """52-week new highs minus new lows among a sample of SP500."""
+def new_highs_minus_lows(sample_size: int | None = None) -> pd.Series:
+    """52-week new highs minus new lows across S&P 500 constituents."""
     panel, wanted = _panel_columns(sample_size)
     if not wanted:
         record_provenance("new_highs_lows", "", kind="unavailable")
         return pd.Series(dtype=float, name="new_highs_minus_lows")
     record_provenance(
-        "new_highs_lows", f"sp500_sample_panel(top {len(wanted)})", kind="computed",
-        note="current-membership sample (survivorship)",
+        "new_highs_lows", f"sp500_panel({len(wanted)} constituents)", kind="computed",
+        note="current membership (survivorship bias)",
     )
     cdf = panel[wanted].ffill()
     hi = cdf.rolling(252).max()
@@ -2069,3 +2077,331 @@ def copper_gold_ratio() -> pd.Series:
     s = (df["cu"] / df["au"]).replace([np.inf, -np.inf], np.nan).dropna()
     s.name = "copper_gold"
     return s
+
+
+
+# ---------------------------------------------------------------------------
+# Committed seeds + frame caches (robust fallback chain for new panels)
+# ---------------------------------------------------------------------------
+# `cache/` is gitignored and ephemeral on Streamlit Cloud, so a disk cache only
+# helps a warm container. Every new chart panel therefore follows:
+#     live fetch  ->  local disk cache  ->  committed seed (src/seeds/*.csv)
+# The seed guarantees a fresh cloud deploy still renders when Yahoo or a
+# scraped page is blocked on a shared IP. Live rows win on shared dates.
+# Regenerate seeds with:  python -m scripts.refresh_seeds
+SEED_DIR = os.path.join(os.path.dirname(__file__), "seeds")
+
+
+def _seed_path(filename: str) -> str:
+    return os.path.join(SEED_DIR, filename)
+
+
+def _read_dated_csv(path: str) -> pd.DataFrame:
+    if not os.path.exists(path):
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(path, parse_dates=["date"])
+        df = df.dropna(subset=["date"]).set_index("date").sort_index()
+        df = df[~df.index.duplicated(keep="last")]
+        return df.apply(pd.to_numeric, errors="coerce")
+    except Exception as e:
+        log.warning("Dated CSV read failed for %s: %s", path, e)
+        return pd.DataFrame()
+
+
+def _load_frame_cache(filename: str) -> pd.DataFrame:
+    return _read_dated_csv(_series_cache_path(filename))
+
+
+def _save_frame_cache(filename: str, df: pd.DataFrame) -> None:
+    try:
+        out = df[~df.index.duplicated(keep="last")].sort_index()
+        out.index.name = "date"
+        out.reset_index().to_csv(_series_cache_path(filename), index=False)
+    except Exception as e:
+        log.warning("Frame cache write failed for %s: %s", filename, e)
+
+
+def _load_seed_frame(filename: str) -> pd.DataFrame:
+    return _read_dated_csv(_seed_path(filename))
+
+
+def _merge_frames(*frames: pd.DataFrame) -> pd.DataFrame:
+    """Union of dated frames; later frames win on duplicate dates."""
+    parts = [f for f in frames if f is not None and not f.empty]
+    if not parts:
+        return pd.DataFrame()
+    out = pd.concat(parts)
+    out = out[~out.index.duplicated(keep="last")].sort_index()
+    out.index.name = "date"
+    return out
+
+
+def _with_fallback_chain(
+    *,
+    keys: tuple[str, ...],
+    live: pd.DataFrame,
+    cache_file: str,
+    seed_file: str,
+    source: str,
+) -> pd.DataFrame:
+    """live -> disk cache -> committed seed, with provenance for every key."""
+    cache = _load_frame_cache(cache_file)
+    seed = _load_seed_frame(seed_file)
+    if live is not None and not live.empty:
+        merged = _merge_frames(seed, cache, live)
+        _save_frame_cache(cache_file, merged)
+        for k in keys:
+            record_provenance(k, source, kind="primary")
+        return merged
+    if not cache.empty:
+        merged = _merge_frames(seed, cache)
+        for k in keys:
+            record_provenance(
+                k, source, kind="cache",
+                note=f"live fetch failed; cached history through {cache.index.max():%Y-%m-%d}",
+            )
+        return merged
+    if not seed.empty:
+        for k in keys:
+            record_provenance(
+                k, "bundled_seed", kind="fallback",
+                note=f"live source unreachable and no local cache; seed through {seed.index.max():%Y-%m-%d}",
+            )
+        return seed
+    for k in keys:
+        record_provenance(k, "", kind="unavailable")
+    return pd.DataFrame()
+
+
+def _frame_col(df: pd.DataFrame, col: str, name: str) -> pd.Series:
+    if df is None or df.empty or col not in df.columns:
+        return pd.Series(dtype=float, name=name)
+    s = pd.to_numeric(df[col], errors="coerce").dropna()
+    s.name = name
+    return s
+
+
+# ---------------------------------------------------------------------------
+# Full-universe S&P 500 participation: 10/20DMA trend breadth + 50D OB/OS
+# ---------------------------------------------------------------------------
+PARTICIPATION_KEYS = ("trend_breadth_10_20", "obos_spread_50d", "obos_ob_pct", "obos_os_pct")
+
+
+@_memoized_fetch
+def sp500_participation_frame() -> pd.DataFrame:
+    """
+    Daily participation panel computed from the shared full-constituent closes:
+      trend_10_20     % of constituents with 10DMA > 20DMA
+      trend_eligible  constituents with both averages defined
+      ob_pct / os_pct % overbought / oversold vs own 50D band (z > +1 / < -1)
+      obos_spread     ob_pct - os_pct (pp)
+      obos_eligible   constituents with a defined 50D band
+    """
+    panel, wanted = _panel_columns()
+    live = pd.DataFrame()
+    if wanted:
+        p = panel[wanted]
+        tb = A.trend_breadth(p, 10, 20).rename(
+            columns={"pct": "trend_10_20", "eligible": "trend_eligible"})
+        ob = A.overbought_oversold_breadth(p, 50, 1.0).rename(
+            columns={"spread": "obos_spread", "eligible": "obos_eligible"})
+        live = pd.concat([tb, ob], axis=1).sort_index()
+    return _with_fallback_chain(
+        keys=PARTICIPATION_KEYS,
+        live=live,
+        cache_file="sp500_participation_history.csv",
+        seed_file="sp500_participation_seed.csv",
+        source=f"sp500_panel({len(wanted)} constituents)" if wanted else "sp500_panel",
+    )
+
+
+def trend_breadth_10_20() -> pd.Series:
+    return _frame_col(sp500_participation_frame(), "trend_10_20", "trend_breadth_10_20")
+
+
+def trend_breadth_eligible() -> pd.Series:
+    return _frame_col(sp500_participation_frame(), "trend_eligible", "trend_breadth_eligible")
+
+
+def obos_spread_50d() -> pd.Series:
+    return _frame_col(sp500_participation_frame(), "obos_spread", "obos_spread_50d")
+
+
+def obos_overbought_pct() -> pd.Series:
+    return _frame_col(sp500_participation_frame(), "ob_pct", "obos_ob_pct")
+
+
+def obos_oversold_pct() -> pd.Series:
+    return _frame_col(sp500_participation_frame(), "os_pct", "obos_os_pct")
+
+
+def obos_eligible() -> pd.Series:
+    return _frame_col(sp500_participation_frame(), "obos_eligible", "obos_eligible")
+
+
+# ---------------------------------------------------------------------------
+# Style rotation: price legs for relative-strength ratios
+# ---------------------------------------------------------------------------
+def iwm_etf() -> pd.Series:
+    """iShares Russell 2000 ETF — fallback numerator if ^RUT is unavailable."""
+    return yf_series("IWM")
+
+
+# ---------------------------------------------------------------------------
+# Nasdaq 100 valuation — forward P/E (VCP Scanner) + trailing P/E (WorldPERatio)
+# ---------------------------------------------------------------------------
+# Bloomberg's BEst forward P/E history is paid. The free, keyless sources:
+#   * VCP Scanner (vcpscanner.com/market-valuation/nasdaq-100) embeds a daily
+#     bottom-up NDX valuation history (consensus forward P/E since 2026-03) in
+#     its Next.js flight payload. Its trailing-P/E history is NOT used — it has
+#     methodology breaks (e.g. 67-74x prints in H2 2022).
+#   * WorldPERatio (worldperatio.com/index/nasdaq-100/) publishes a monthly
+#     trailing P/E for the Nasdaq 100 (computed on QQQ) since 1990, stamped at
+#     the 1st of each month but holding the END-of-month value (verified: the
+#     monthly change correlates 0.76 with month-end QQQ returns vs -0.07 for
+#     start-of-month). The final point is the live value "calculated on" the
+#     date printed on the page.
+# Forward history accumulates in the disk cache each build; the trailing
+# series supplies the genuine 5-year perspective and drives the scored
+# valuation indicator.
+_PE_SANE = (3.0, 200.0)
+
+
+def _next_flight_text(html: str) -> str:
+    """Concatenate + JSON-unescape a Next.js app-router flight payload."""
+    chunks = re.findall(r'self\.__next_f\.push\(\[1,"(.*?)"\]\)', html, re.S)
+    out = []
+    for c in chunks:
+        try:
+            out.append(json.loads('"' + c + '"'))
+        except Exception:
+            continue
+    return "".join(out)
+
+
+def _parse_vcp_history(html: str) -> pd.DataFrame:
+    text = _next_flight_text(html)
+    i = text.find('"initialHistory"')
+    if i < 0:
+        return pd.DataFrame()
+    start = text.find("[", i)
+    if start < 0:
+        return pd.DataFrame()
+    try:
+        arr, _ = json.JSONDecoder().raw_decode(text[start:])
+    except Exception:
+        return pd.DataFrame()
+    if not isinstance(arr, list) or not arr:
+        return pd.DataFrame()
+    df = pd.DataFrame(arr)
+    if "snapshot_date" not in df.columns:
+        return pd.DataFrame()
+    df["date"] = pd.to_datetime(df["snapshot_date"], errors="coerce")
+    df = df.dropna(subset=["date"]).set_index("date").sort_index()
+    df = df[~df.index.duplicated(keep="last")]
+    out = pd.DataFrame(index=df.index)
+    for col in ("forward_pe", "trailing_pe"):
+        if col in df.columns:
+            v = pd.to_numeric(df[col], errors="coerce")
+            out[col] = v.where((v > _PE_SANE[0]) & (v < _PE_SANE[1]))
+    out.index.name = "date"
+    return out
+
+
+def _vcp_ndx_history() -> pd.DataFrame:
+    url = "https://vcpscanner.com/market-valuation/nasdaq-100"
+    try:
+        r = requests.get(url, headers=UA, timeout=15)
+        if not r.ok:
+            return pd.DataFrame()
+        return _parse_vcp_history(r.text)
+    except Exception as e:
+        log.info("VCP Scanner NDX valuation unavailable (%s)", str(e)[:80])
+        return pd.DataFrame()
+
+
+def ndx_forward_pe() -> pd.Series:
+    """Nasdaq 100 forward (next-12M consensus) P/E, daily. live -> cache -> seed."""
+    hist = _vcp_ndx_history()
+    live = pd.DataFrame()
+    if not hist.empty and "forward_pe" in hist.columns:
+        live = hist[["forward_pe"]].dropna()
+    df = _with_fallback_chain(
+        keys=("ndx_forward_pe",),
+        live=live,
+        cache_file="ndx_forward_pe_history.csv",
+        seed_file="ndx_forward_pe_seed.csv",
+        source="vcpscanner:nasdaq100 forward_pe",
+    )
+    return _frame_col(df, "forward_pe", "ndx_forward_pe")
+
+
+def _parse_worldperatio(html: str) -> pd.Series:
+    empty = pd.Series(dtype=float, name="ndx_trailing_pe")
+    m = re.search(r"detailPE_data\s*=\s*\[(.*?)\];", html, re.S)
+    if not m:
+        return empty
+    pts = re.findall(r"Date\.UTC\((\d+),\s*(\d+),\s*(\d+)\)\s*,\s*([-\d\.]+)\]", m.group(1))
+    if not pts:
+        return empty
+    idx, vals = [], []
+    for y, mo, _d, v in pts:
+        try:
+            # JS months are 0-based; the value is the month-END reading.
+            idx.append(pd.Timestamp(int(y), int(mo) + 1, 1) + pd.offsets.MonthEnd(0))
+            vals.append(float(v))
+        except Exception:
+            continue
+    if not idx:
+        return empty
+    s = pd.Series(vals, index=pd.DatetimeIndex(idx), name="ndx_trailing_pe").sort_index()
+    s = s[~s.index.duplicated(keep="last")]
+    s = s[(s > _PE_SANE[0]) & (s < _PE_SANE[1])]
+    # The last point is the live, month-to-date value: stamp it with the page's
+    # "calculated on" date instead of the (future) month-end.
+    plain = re.sub(r"<[^>]+>", " ", html)
+    plain = re.sub(r"\s+", " ", plain)
+    calc = re.search(r"calculated on\s*(\d{1,2}\s+[A-Za-z]+\s+\d{4})", plain)
+    if calc and len(s) >= 2:
+        try:
+            calc_dt = pd.Timestamp(pd.to_datetime(calc.group(1), errors="raise")).normalize()
+            if s.index[-2] < calc_dt <= s.index[-1]:
+                cur = re.search(r"Ratio for [^.]*? is\s*([\d\.]+)\s*,?\s*calculated on", plain)
+                last_val = float(cur.group(1)) if cur else float(s.iloc[-1])
+                s = pd.concat([s.iloc[:-1], pd.Series([last_val], index=[calc_dt])])
+                s.name = "ndx_trailing_pe"
+        except Exception:
+            pass
+    return s
+
+
+def _worldperatio_ndx() -> pd.Series:
+    url = "https://worldperatio.com/index/nasdaq-100/"
+    try:
+        r = requests.get(url, headers=UA, timeout=15)
+        if not r.ok:
+            return pd.Series(dtype=float, name="ndx_trailing_pe")
+        return _parse_worldperatio(r.text)
+    except Exception as e:
+        log.info("WorldPERatio NDX P/E unavailable (%s)", str(e)[:80])
+        return pd.Series(dtype=float, name="ndx_trailing_pe")
+
+
+def ndx_trailing_pe() -> pd.Series:
+    """Nasdaq 100 trailing P/E (QQQ basis): monthly history + live latest point."""
+    s = _worldperatio_ndx()
+    live = s.to_frame("trailing_pe") if not s.empty else pd.DataFrame()
+    df = _with_fallback_chain(
+        keys=("ndx_trailing_pe",),
+        live=live,
+        cache_file="ndx_trailing_pe_history.csv",
+        seed_file="ndx_trailing_pe_seed.csv",
+        source="worldperatio:nasdaq-100 (QQQ)",
+    )
+    out = _frame_col(df, "trailing_pe", "ndx_trailing_pe")
+    if out.empty:
+        return out
+    # A future month-end stamp (e.g. a page served without the "calculated on"
+    # line) would fake freshness for staleness checks — drop it.
+    return out[out.index <= pd.Timestamp.now().normalize()]

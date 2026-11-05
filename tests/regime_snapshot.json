@@ -1,18 +1,18 @@
 {
   "buckets": {
-    "breadth_momentum": 42.703,
+    "breadth_momentum": 45.1811,
     "credit_liquidity": 52.7245,
     "sentiment_positioning": 46.7113,
-    "valuation": 14.8008
+    "valuation": 56.1095
   },
   "cluster": {
     "bottom_cluster_count": 6,
     "bottom_theme_count": 5,
-    "top_cluster_count": 4,
-    "top_theme_count": 4
+    "top_cluster_count": 5,
+    "top_theme_count": 5
   },
-  "comp_hist_last": 44.723,
-  "composite": 44.723,
+  "comp_hist_last": 49.5973,
+  "composite": 49.5973,
   "covered_weight": 1.0,
   "scores": {
     "aaii_bull_bear": 35.3519,
@@ -35,14 +35,17 @@
     "index_put_call": 32.8018,
     "move_index": null,
     "naaim": 51.2346,
+    "ndx_trailing_pe": 97.4182,
     "net_liquidity": 34.106,
     "new_highs_lows": 94.5364,
+    "obos_spread_50d": 65.8744,
     "pct_above_200dma": 14.5161,
     "put_call": 99.169,
     "real_yield_10y": 99.5851,
     "rsi_spx": 10.5691,
     "skew": 19.6457,
     "sofr_spread": 87.7193,
+    "trend_breadth_10_20": 44.3124,
     "vix": 45.4082,
     "vix_term_1m_3m": 2.5918,
     "vix_term_9d_1m": 77.686,

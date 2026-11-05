@@ -160,14 +160,14 @@ def _fetch_parallel(tasks: dict[str, Callable[[], pd.Series]]) -> Dict[str, pd.S
 
 
 def _ad_line_proxy() -> pd.Series:
-    """A/D line proxy: sign of daily returns across a liquid S&P sample.
+    """A/D line proxy: sign of daily returns across all S&P 500 constituents.
 
-    Reuses the shared S&P close panel (top 100, last ~1y) instead of issuing its
-    own bulk download. The 1-year tail reproduces the original period="1y" input
+    Reuses the shared full-constituent close panel instead of issuing its own
+    bulk download. The 1-year tail reproduces the original period="1y" input
     to the cumulative advance-decline calculation.
     """
     try:
-        panel, wanted = D._panel_columns(100)
+        panel, wanted = D._panel_columns()
         if not wanted:
             D.record_provenance("ad_line_slope", "", kind="unavailable")
             return _empty_series("ad_line_slope")
@@ -176,8 +176,8 @@ def _ad_line_proxy() -> pd.Series:
         ad = (rets > 0).sum(axis=1) - (rets < 0).sum(axis=1)
         ad.name = "ad_line_slope"
         D.record_provenance(
-            "ad_line_slope", f"sp500_sample_panel(top {len(wanted)})", kind="computed",
-            note="A/D proxy from current-membership sample, not NYSE official",
+            "ad_line_slope", f"sp500_panel({len(wanted)} constituents)", kind="computed",
+            note="A/D proxy from current S&P 500 membership, not NYSE official",
         )
         return ad.cumsum()
     except Exception as e:
@@ -216,6 +216,12 @@ def build_raw() -> RawFrame:
         "pct_above_200dma": D.breadth_pct_above_200dma,
         "new_highs_lows": D.new_highs_minus_lows,
         "ad_line_slope": _ad_line_proxy,
+        # Full-universe participation (one shared panel, memoized frame)
+        "trend_breadth_10_20": D.trend_breadth_10_20,
+        "trend_breadth_eligible": D.trend_breadth_eligible,
+        "obos_spread_50d": D.obos_spread_50d,
+        "obos_ob_pct": D.obos_overbought_pct,
+        "obos_os_pct": D.obos_oversold_pct,
 
         # ---- Sentiment & Positioning
         "naaim": D.naaim_exposure,
@@ -228,6 +234,8 @@ def build_raw() -> RawFrame:
 
         # ---- Valuation
         "equity_risk_premium": D.equity_risk_premium,
+        "ndx_trailing_pe": D.ndx_trailing_pe,
+        "ndx_forward_pe": D.ndx_forward_pe,
 
         # ---- Advanced / bonus
         "corr_cluster": D.correlation_cluster,
@@ -463,7 +471,32 @@ def per_indicator_history(raw: RawFrame) -> pd.DataFrame:
 
     if not per_indicator:
         return pd.DataFrame()
-    return pd.DataFrame(per_indicator)
+    return _carry_scores_to_edge(pd.DataFrame(per_indicator))
+
+
+def _carry_scores_to_edge(df: pd.DataFrame) -> pd.DataFrame:
+    """Carry each indicator's LAST valid score forward to the frame's end date.
+
+    Feeds publish on different lags (FRED's DGS10 a day behind yfinance, weekly
+    NAAIM/AAII/CTA/NFCI up to a week behind), so the final rows of the joint
+    frame are ragged. Without this, the historical pillar on those rows averages
+    only the indicators that happened to print that day — e.g. the Valuation
+    pillar swung from ~38 to ~0 when the daily NDX P/E printed a day after the
+    ERP — while the live gauge (score_indicators) uses each indicator's last
+    valid score. Carrying the last known reading forward is point-in-time
+    correct (it was the latest information on those days) and makes the chart
+    endpoint, pillar momentum and the gauge agree. Only the trailing edge is
+    filled; interior gaps (warm-up, zero-std stretches) are left untouched.
+    """
+    if df.empty:
+        return df
+    out = df.copy()
+    for col in out.columns:
+        last = out[col].last_valid_index()
+        if last is None or last == out.index[-1]:
+            continue
+        out.loc[out.index > last, col] = out.at[last, col]
+    return out
 
 
 def _weighted_bucket_mean(per_ind: pd.DataFrame, cols: list[str]) -> pd.Series:
