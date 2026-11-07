@@ -77,10 +77,10 @@ INDICATORS: list[IndicatorSpec] = [
         description="ICE BofA US Corporate OAS. Wide = credit stress = bottom. Tight = complacency = top.",
     ),
     IndicatorSpec(
-        key="move_index", label="Bond Vol (TLT realized-vol proxy)",
-        bucket="credit_liquidity", source="yfinance:TLT realized vol (MOVE proxy)",
+        key="move_index", label="Bond Vol (ICE MOVE)",
+        bucket="credit_liquidity", source="yfinance:^MOVE (TLT realized-vol proxy if unavailable)",
         direction="contrarian_high_is_top",
-        description="Bond-market volatility proxied by TLT 20d realized vol (true MOVE implied-vol index is not free on yfinance). High = liquidity stress = bottom setup (mirrors VIX).",
+        description="ICE BofA MOVE: implied volatility of US Treasuries. Falls back to scaled TLT 20d realized vol if ^MOVE is unavailable. High = liquidity stress = bottom setup (mirrors VIX).",
     ),
     IndicatorSpec(
         key="net_liquidity", label="Fed Net Liquidity (WALCL - TGA - RRP)",

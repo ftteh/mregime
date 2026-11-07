@@ -450,9 +450,14 @@ def vix_term_1m_3m() -> pd.Series:
 @_memoized_fetch
 def move_index() -> pd.Series:
     """
-    MOVE index is not directly on yfinance. We proxy with realized vol of TLT
-    (20-trading-day annualized) scaled to MOVE range if live MOVE is unavailable.
+    ICE BofA MOVE index from Yahoo (^MOVE). If it's unavailable, proxy with TLT
+    20-trading-day annualized realized vol scaled to the MOVE range.
     """
+    move = yf_series("^MOVE", period="5y")
+    if len(move) >= 252:
+        move.name = "move_index"
+        record_provenance("move_index", "yfinance:^MOVE", kind="primary")
+        return move
     tlt = yf_series("TLT", period="5y")
     if tlt.empty:
         record_provenance("move_index", "", kind="unavailable")
@@ -462,7 +467,6 @@ def move_index() -> pd.Series:
     # Scale roughly into MOVE units (MOVE ~ 80-200 range, TLT rv ~ 8-25%)
     proxy = vol_ann * 8
     proxy.name = "move_proxy"
-    # Always a proxy (the real ICE MOVE index is not free) — surfaced as such.
     record_provenance("move_index", "tlt_realized_vol_proxy", kind="proxy",
                       note="TLT 20d realized vol scaled; not the ICE MOVE index")
     return proxy.dropna()
@@ -1259,6 +1263,28 @@ def _cboe_live_put_call_ratio(symbols: tuple[str, ...], max_expiries: int = 3) -
     return round(total_puts / total_calls, 4)
 
 
+def _cboe_daily_ratio(kind: str, name: str) -> pd.Series:
+    """Official put/call from Cboe's daily statistics files (Oct 2019 onward).
+
+    Cboe's CSV archive stops in Oct 2019 and YCharts is unreliable from here, so
+    without this leg the "official" series has years of gaps and its latest row
+    is an SPY/QQQ/IWM chain proxy that can disagree badly with the real ratio.
+    """
+    from src import research_data as RD  # local import: research_data imports this module
+
+    try:
+        df = RD.cboe_volumes()
+    except Exception as e:
+        log.info("Cboe daily volumes unavailable: %s", str(e)[:100])
+        return pd.Series(dtype=float, name=name)
+    put, call = f"{kind}_put", f"{kind}_call"
+    if df is None or df.empty or put not in df or call not in df:
+        return pd.Series(dtype=float, name=name)
+    s = (df[put] / df[call].replace(0, np.nan)).dropna()
+    s.name = name
+    return s
+
+
 def _official_put_call_series(
     *,
     kind: str,
@@ -1269,6 +1295,7 @@ def _official_put_call_series(
 ) -> pd.Series:
     hist = _cboe_put_call_history(kind, name)
     recent = _ycharts_recent_indicator(ycharts_slug, name)
+    daily = _cboe_daily_ratio(kind, name)
     cache = _load_series_cache(cache_filename, name)
     if not cache.empty:
         # Scrub previously-persisted phantom dates (weekend/holiday stamps
@@ -1277,13 +1304,15 @@ def _official_put_call_series(
 
     live = pd.Series(dtype=float, name=name)
     last_market_day = last_completed_trading_day()
-    recent_last = recent.index.max().normalize() if not recent.empty else pd.Timestamp.min
+    official = pd.concat([recent, daily])
+    recent_last = official.index.max().normalize() if not official.empty else pd.Timestamp.min
     if recent_last < last_market_day:
         live_val = _cboe_live_put_call_ratio(live_symbols)
         if live_val is not None:
             live = pd.Series([live_val], index=[last_market_day], name=name)
 
-    merged = _merge_series(name, hist, cache, recent, live)
+    # Later legs win, so official daily rows replace any proxy rows cached earlier.
+    merged = _merge_series(name, hist, cache, recent, daily, live)
     if not live.empty:
         _save_series_cache(cache_filename, merged, name)
 
@@ -1291,7 +1320,7 @@ def _official_put_call_series(
     # the live score reads) came from the intraday ETF-chain proxy.
     legs = [
         lbl for lbl, leg in (
-            ("cboe_official", hist), ("ycharts", recent),
+            ("cboe_official", hist), ("ycharts", recent), ("cboe_daily", daily),
             ("cache", cache), ("live_etf_chain_proxy", live),
         ) if not leg.empty
     ]
@@ -1313,8 +1342,9 @@ def put_call_ratio() -> pd.Series:
 
     Source priority:
     1. CBOE official CSV archive/recent files through Oct 2019
-    2. YCharts public recent CBOE daily-stat rows
-    3. CBOE delayed option-chain live ETF proxy + local cache
+    2. CBOE daily market statistics files from Oct 2019
+    3. YCharts public recent CBOE daily-stat rows
+    4. CBOE delayed option-chain live ETF proxy + local cache
     """
     return _official_put_call_series(
         kind="equity",
@@ -1509,6 +1539,9 @@ def squeezemetrics_gex() -> pd.Series:
 # ---------------------------------------------------------------------------
 # CTA / Leveraged-Fund Equity Positioning (CFTC COT TFF)
 # ---------------------------------------------------------------------------
+ES_CONTRACT_CODE = "13874A"  # E-mini S&P 500, CME
+
+
 def cftc_cta_positioning() -> pd.Series:
     """
     CFTC Traders in Financial Futures (TFF) — Leveraged Funds net position
@@ -1538,11 +1571,11 @@ def cftc_cta_positioning() -> pd.Series:
             if not csv_files:
                 continue
             df = pd.read_csv(z.open(csv_files[0]), low_memory=False)
-            # Keep only S&P 500 E-mini rows
-            mask = df["Market_and_Exchange_Names"].str.contains(
-                "E-MINI S&P 500", na=False, case=False
-            )
-            sub = df[mask].copy()
+            # Match the contract code, not the name: "E-MINI S&P 500" also
+            # matches the much smaller Micro contract (13874U), and the two can
+            # sit on opposite sides of the market.
+            codes = df["CFTC_Contract_Market_Code"].astype(str).str.strip()
+            sub = df[codes == ES_CONTRACT_CODE].copy()
             if sub.empty:
                 continue
             frames.append(sub)

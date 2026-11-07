@@ -43,6 +43,26 @@ positioning, vol, and valuation — all from **free data sources**.
 - **Standardized signals** — every series as a rolling 1-year z-score with 1Y percentile, a signed-fill chart
   and an extremes scanner (|z| ≥ 2), oriented into top-risk / bottom-setup language
 
+**Decision desk** — four independent questions under Today's read, kept separate from the composite:
+- **Is the system intact?** Guardrails on breadth, participation, IG / HY / CCC credit, funding, correlation, NFCI
+- **Is fear washed out?** A capitulation checklist; the 7 core rules are backtested, the rest add context
+- **Has price confirmed?** Panic gauges rolling over, QQQ reclaiming its averages, MOVE and yields falling
+- **Is leverage safe?** VIX futures crowding, index correlation, dealer gamma, VIX level. Plus the rotation stage
+
+The desk also limits the **Recommended Exposure** card. It can only go above 100% when the leverage gate
+isn't closed and at least 3 of 5 confirmations are met; otherwise it's capped at 100% and says why. A bottom cluster
+reads Medium conviction until price confirms. If the desk can't run, the card stays capped. The composite score is
+not affected.
+
+**Research desk** — one view at a time:
+- **Positioning** — CFTC crowding across 10 futures markets, all-time vs 3-year percentile, flows, QQQ short interest
+- **Rotation** — RSP/SPY regime, RSP−XLK by month, sector and cross-asset scoreboards, 20/50/200DMA participation
+- **AI & momentum** — AI group and single-name returns, S&P vs AI correlation, momentum and crowded-long proxies
+- **Vol & options** — VXN vs VIX, SOX 5-day flushes, SKEW percentile, put and VIX-call volume, F&G components
+- **Rates & credit** — cross-asset growth PCA, 10Y weekly RSI episodes, bond composite, MOVE, IG vs CCC, Excess CAPE
+- **Technical board** — RSI, moving averages, drawdowns and crosses across assets
+- **Playbook** — forward returns for 15 signals next to the base rate, the checklist backtest, midterm seasonality
+
 **Time-series charts** for every key series with annotated reference levels.
 
 **Full indicator table** — raw value, 3Y percentile, top-risk score, freshness.
@@ -113,6 +133,11 @@ Cold starts can take **1–2 minutes** (downloads breadth data). The `cache/` pu
 | **Wikipedia** | SP500 constituents | scraped table |
 | **VCP Scanner** | Nasdaq 100 forward P/E (bottom-up consensus, daily since 2026-03) | public page, Next.js payload (no key); disk cache + committed seed |
 | **WorldPERatio** | Nasdaq 100 trailing P/E (QQQ basis, monthly since 1990 + live point) | public page (no key); disk cache + committed seed |
+| **CFTC** | Positioning for 10 futures markets since 2006 (TFF and Disaggregated reports) | Socrata API (no key); disk cache + committed seed |
+| **Cboe** | Daily call and put volumes by product since Oct 2019; also the official equity and index put/call ratios | one public JSON per day; committed seed, recent days fetched live |
+| **Yahoo Finance** (research) | ^MOVE, ^VXN, ^SOX, ^TYX, ^KS11, sector / factor / AI-basket prices | `yfinance`; disk cache + committed seed |
+| **Shiller + multpl** | CAPE and Excess CAPE yield since 1881, extended with FRED | public file and page (no key) |
+| **Nasdaq** | QQQ short interest (Nasdaq-listed securities only) | public API (no key) |
 
 All fetchers are wrapped with try/except — if one source is down, the rest of the
 dashboard still works. The newer panels (participation breadth, Nasdaq 100 P/E) follow
@@ -162,6 +187,11 @@ quant/
     ├── indicators.py      # Percentile/z-score engine, composite scorer
     ├── analytics.py       # Pure math: breadth, OB/OS, relative strength, valuation stats, z-scores
     ├── charts.py          # Plotly builders for the market-internals / z-score panels
+    ├── research.py        # Pure research engine: positioning, correlation, PCA, event studies, decision rules
+    ├── research_data.py   # Research feeds with live -> cache -> seed fallback
+    ├── research_charts.py # Plotly builders for the research desk
+    ├── desk.py            # Assembles rules, tables and the model posture
+    ├── desk_ui.py         # Streamlit rendering for the decision and research desks
     └── seeds/             # Committed fallback history (regenerate: python -m scripts.refresh_seeds)
 ```
 
@@ -174,9 +204,17 @@ quant/
 
 ## Known caveats
 
-- **MOVE Index**: proprietary (ICE BofAML). We proxy with scaled TLT 20-day realized vol.
-  For the real series, add an ICE subscription or scrape `markets.ft.com/data/indices/tearsheet/summary?s=MOVE:IOM`.
-- **Put/Call**: CBOE rotates their free CSV URLs occasionally — may need a minor patch.
+- **MOVE Index**: read from Yahoo (`^MOVE`), with scaled TLT 20-day realized vol as the fallback.
+- **Decision desk**: rule output from public data, not investment advice. The rules sit beside the composite and
+  never change its score. Proxies are labelled: GVIP−SPY measures how crowded longs traded, not actual
+  prime-book gross exposure, and MTUM−SPY is a long-only stand-in for long/short momentum.
+- **Event studies**: permutation p-values on overlapping crisis events, across many signals and horizons. Some rows
+  will clear p ≤ 0.05 by chance, and thin buckets are flagged. Treat them as evidence, not forecasts.
+- **CFTC**: as of Tuesday, published Friday. Backtests lag flags to publication. Leveraged-fund Treasury shorts are
+  largely the basis trade, so read the 3-year percentile alongside the all-time one.
+- **ICE credit spreads on FRED**: only about 3 years are served, so older history depends on the local cache and seed.
+- **Put/Call**: official Cboe ratios. An ETF-chain proxy only fills a day with no official row yet, and is flagged.
+- **NAAIM**: the publisher moved its history behind a login, so this feed currently returns nothing.
 - **Breadth**: computed across all ~503 current S&P 500 constituents (one 5-year bulk download,
   ~15s), equal-weighted. Uses current membership, so history carries survivorship bias.
 - **Nasdaq 100 forward P/E**: Bloomberg's BEst series is paid. The free forward history (VCP Scanner)

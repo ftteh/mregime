@@ -48,6 +48,9 @@ from src.config import (
 )
 from src import analytics as AN
 from src import charts as CH
+from src import desk as DK
+from src import desk_ui as DKUI
+from src import research_data as RD
 from src.indicators import (
     build_raw,
     cluster_signal,
@@ -126,6 +129,14 @@ def load_all():
     momentum = pillar_momentum(raw, pillars=pillars)
     comp_hist = historical_composite(raw, pillars=pillars)
     return raw, scores, comp, cluster, momentum, comp_hist, pillars
+
+
+@st.cache_data(ttl=60 * 60, show_spinner="Building the research desk…")
+def load_research():
+    """Research feeds and decision rules. Runs after load_all, whose constituent
+    panel it reuses; a failure here leaves the composite dashboard untouched."""
+    bundle = RD.build_research()
+    return bundle, DK.assemble(bundle, load_all()[0].series)
 
 
 # ---------------------------------------------------------------------------
@@ -478,6 +489,17 @@ label, emoji, color = regime_label(composite_score) if not np.isnan(composite_sc
 COVERED_WEIGHT = comp.get("covered_weight", 1.0)
 exp_rec = exposure_recommendation(composite_score, cluster, covered_weight=COVERED_WEIGHT)
 
+# The exposure card needs the desk's leverage read, so the desk loads first. It's
+# isolated: a research-feed failure leaves _desk empty, which keeps the card at
+# or below 100% instead of taking the page down.
+try:
+    _research_bundle, _desk = load_research()
+    _desk_load_error = None
+except Exception as _desk_err:  # noqa: BLE001
+    _research_bundle, _desk, _desk_load_error = None, None, type(_desk_err).__name__
+_leverage = DK.leverage_permission(_desk)
+exp_rec = DK.apply_leverage_cap(exp_rec, _leverage)
+
 # Trend: what was our suggested exposure ~5 business days ago?
 prev_exp = None
 prev_score = np.nan
@@ -485,7 +507,8 @@ try:
     if comp_hist is not None and not comp_hist.empty and len(comp_hist) >= 6:
         prev_score = float(comp_hist.iloc[-6])  # ~1 week back (5 business days)
         if not np.isnan(prev_score):
-            prev_exp = exposure_recommendation(prev_score, cluster=None)
+            # Same cap as today, so the week-on-week change compares like with like.
+            prev_exp = DK.apply_leverage_cap(exposure_recommendation(prev_score, cluster=None), _leverage)
 except Exception:
     prev_exp = None
 
@@ -680,6 +703,13 @@ with hc_exp:
         elif not np.isnan(prev_score):
             trend_html = f"1w-ago composite: {prev_score:.0f}"
 
+        cap_html = ""
+        if exp_rec.get("uncapped_pct") is not None:
+            cap_html = (
+                "<div style='color:#e0a84a; font-size:0.76rem; font-weight:700; line-height:1.35; margin-bottom:6px;'>"
+                f"Capped from {exp_rec['uncapped_pct']}%: {exp_rec['cap_reason']}</div>"
+            )
+
         override_badge = (
             "<div style='display:inline-block; background:#c0392b; color:#fff; "
             "font-size:0.7rem; font-weight:700; padding:3px 8px; border-radius:4px; "
@@ -711,6 +741,7 @@ with hc_exp:
   <div style='font-size: 0.95rem; color: #fff; font-weight: 700; margin-bottom: 12px; line-height: 1.2;'>
     {exp_label}
   </div>
+  {cap_html}
   <div style='font-size: 0.8rem; color: #ccc; line-height: 1.6; text-align: left; padding: 0 4px;'>
     <div>Hedge: <b style='color:{hedge_color};'>{hedge_txt}</b></div>
     <div>Conviction: <b>{conviction}</b></div>
@@ -853,6 +884,20 @@ pillar_names = {
     "valuation": "Valuation",
 }
 _todays_read()
+
+
+# ---------------------------------------------------------------------------
+# DECISION DESK — is the system intact, is fear washed out, has price confirmed,
+# is leverage safe? Isolated so a research-feed failure can't take the page down.
+# ---------------------------------------------------------------------------
+try:
+    if _desk is None:
+        raise RuntimeError(_desk_load_error or "no desk data")
+    DKUI.render_decision_desk(_desk)
+    DKUI.render_research(_desk, _research_bundle, raw.series)
+except Exception as _desk_err:  # noqa: BLE001
+    st.warning(f"Research desk unavailable this run ({_desk_load_error or type(_desk_err).__name__}). "
+               "The composite still works, and the exposure card stays at or below 100%.")
 
 
 # ---------------------------------------------------------------------------
