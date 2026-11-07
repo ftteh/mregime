@@ -913,8 +913,16 @@ def _unavailable(key: str, label: str, threshold: str, core: bool = False) -> Ru
     return Rule(key, label, float("nan"), threshold, False, core=core, available=False)
 
 
+# Rules that count toward the verdict. SKEW stays on the checklist as context but
+# isn't counted: its edge was negative in both 2003-2016 and 2017-2026, so a high
+# reading isn't bullish evidence. See .claude/plan/rule-backtest-results.md.
+CORE_RULES = ("qqq_rsi", "vxn", "sox_flush", "vix_spike", "momentum", "hf_unwind")
+
+
 def capitulation_history(prices: pd.DataFrame) -> pd.DataFrame:
-    """Daily booleans for the CORE capitulation rules (long, price-derived history).
+    """Daily booleans for the capitulation rules (long, price-derived history).
+
+    Includes the context-only SKEW rule; count only `CORE_RULES`.
 
     Each rule stays on for a short memory window because capitulation signals
     arrive in sequence over a few sessions, not all on one close. Percentile
@@ -994,12 +1002,12 @@ def capitulation_rules(
         rules.append(Rule("vix_spike", "VIX one-day spike", top, "+30% in last 5 sessions", on("vix_spike"),
                           near=top >= 20, core=True, detail=f"largest close-to-close rise, VIX {vix.iloc[-1]:.1f}"))
     if len(skew) <= 1500:
-        rules.append(_unavailable("skew", "Tail-hedge demand (SKEW)", "≥ rolling 10Y 98.5th pct in 10 sessions", True))
+        rules.append(_unavailable("skew", "Tail-hedge demand (SKEW)", "≥ rolling 10Y 98.5th pct in 10 sessions"))
     else:
         p = pct_rank(skew.iloc[-2520:])
         recent = pct_rank(skew.iloc[-2520:], float(skew.iloc[-10:].max()))
         rules.append(Rule("skew", "Tail-hedge demand (SKEW)", float(skew.iloc[-1]),
-                          "≥ rolling 10Y 98.5th pct in 10 sessions", on("skew"), near=recent >= 90, core=True,
+                          "≥ rolling 10Y 98.5th pct in 10 sessions", on("skew"), near=recent >= 90,
                           detail=f"now {ordinal(p)} pct of 10Y, 10-session high {ordinal(recent)}"))
     for key, label, a in (("momentum", "Momentum unwind (MTUM−SPY 5D)", mtum), ("hf_unwind", "Crowded HF longs unwind (GVIP−SPY 5D)", gvip)):
         if len(a) <= 500 or spy.empty:
@@ -1068,9 +1076,8 @@ def capitulation_backtest(history: pd.DataFrame, target: pd.Series, horizons=(10
     if history is None or history.empty:
         return pd.DataFrame()
     # Only dates where every rule had enough history to be able to fire.
-    count = history.sum(axis=1)
-    usable = history.index[history.index >= _rules_live_from(history)]
-    count = count.reindex(usable)
+    count = history[[c for c in CORE_RULES if c in history.columns]].sum(axis=1)
+    count = count.reindex(history.index[history.index >= _rules_live_from(history)])
     p = clean(target)
     rows = []
     for lo, hi, name in ((0, 0, "0"), (1, 2, "1–2"), (3, 4, "3–4"), (5, 99, "5+")):
@@ -1086,7 +1093,7 @@ def capitulation_backtest(history: pd.DataFrame, target: pd.Series, horizons=(10
 
 def _rules_live_from(history: pd.DataFrame) -> pd.Timestamp:
     """First date on which every core rule could plausibly have fired."""
-    firsts = [history[c][history[c]].index[0] for c in history.columns if history[c].any()]
+    firsts = [history[c][history[c]].index[0] for c in CORE_RULES if c in history.columns and history[c].any()]
     return max(firsts) if firsts else history.index[0]
 
 

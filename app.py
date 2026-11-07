@@ -157,7 +157,7 @@ with st.sidebar:
         st.info(
             "**AAII sentiment** is optional: add a free Nasdaq Data Link key as "
             "`NASDAQ_DATA_LINK_API_KEY` in `.env` to unlock it. "
-            "(NAAIM + F&G + VIX + SKEW already cover sentiment.)"
+            "(F&G + VIX + SKEW already cover sentiment.)"
         )
 
     if st.button("Refresh data", width="stretch"):
@@ -789,14 +789,6 @@ with hc3:
         bad_direction="down",
     )
     _metric_tile(
-        "NAAIM Exposure",
-        raw.series.get("naaim"),
-        value_fmt="{:.1f}",
-        delta_mode="diff",
-        delta_fmt="{:+.1f}",
-        bad_direction="up",
-    )
-    _metric_tile(
         "AAII Bull−Bear",
         raw.series.get("aaii_bull_bear"),
         value_fmt="{:+.1f}",
@@ -988,7 +980,6 @@ INDICATOR_UNITS: dict[str, str] = {
     "rsi_spx": "",
     "new_highs_lows": "",
     "aaii_bull_bear": "pp",
-    "naaim": "",
     "fear_greed": "/100",
     "put_call": "",
     "vix": "",
@@ -1695,14 +1686,6 @@ with rc2:
         "SPY vs (TLT+GLD)/2  20D correlation",
         ref_lines=[(0.6, "liquidity event")],
         extra_direction="risk_high_is_top",
-        marker_ts=ts_marker,
-    )
-    # Row 4 — manager sentiment (pairs with retail F&G)
-    _line(
-        raw.series.get("naaim"),
-        "NAAIM Exposure",
-        ref_lines=[(30, "defensive"), (100, "leveraged")],
-        indicator_key="naaim",
         marker_ts=ts_marker,
     )
     # Row 5 — futures positioning (pairs with AAII survey)

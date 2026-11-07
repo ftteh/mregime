@@ -89,7 +89,7 @@ def render_decision_desk(d: dict) -> None:
     with c2:
         st.markdown(_card("2 · IS FEAR WASHED OUT?", cap["state"], cap["tone"],
                           f"{cap['core_fired']} of {cap['core_total']} core rules fired, "
-                          f"{cap['all_fired']} of {cap['all_total']} overall.",
+                          f"{cap['all_fired']} of {cap['all_total']} overall. Not reliable alone: read with card 1.",
                           _rule_rows(d["rules"])), unsafe_allow_html=True)
     live = [r for r in d["confirm"] if r.available]
     fired = sum(r.fired for r in live)
@@ -435,6 +435,11 @@ def _view_playbook(d: dict, b: RD.ResearchBundle) -> None:
         }), hide_index=True, width="stretch")
         st.caption(f"Since {R._rules_live_from(d['cap_history']):%b %Y}, when every core rule could fire. Episodes need 10 quiet "
                    "sessions apart, except the 0 bucket. The 5+ bucket is very thin, so don't read it as a reliable rate.")
+        st.warning("This table covers the era the rules were built on. On untouched 2003–2016 data, 3+ of 5 long-history "
+                   "rules lagged the base rate: −3.2pp at 21 sessions over 11 episodes, 5 of them in late 2008. Without late "
+                   "2008 the result was flat at 21 sessions and not significant at 63. SKEW was one of those 5 and was then "
+                   "removed from the core count, so today's 6-rule count has no clean test of its own. Treat a washout as a "
+                   "condition to watch, not as evidence of a bottom.")
     sm = R.midterm_seasonality(b.spx_monthly)
     if not sm.empty:
         done = sm["six_m"].dropna()

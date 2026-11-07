@@ -130,12 +130,6 @@ INDICATORS: list[IndicatorSpec] = [
         description="Retail sentiment. Extreme bullish spread = contrarian top.",
     ),
     IndicatorSpec(
-        key="naaim", label="NAAIM Exposure Index",
-        bucket="sentiment_positioning", source="csv:naaim.org",
-        direction="risk_high_is_top",
-        description="Active manager equity exposure. >100 leveraged long = top, <30 = bottom setup.",
-    ),
-    IndicatorSpec(
         key="fear_greed", label="CNN Fear & Greed",
         bucket="sentiment_positioning", source="api:cnn",
         direction="risk_high_is_top",

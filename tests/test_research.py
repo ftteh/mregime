@@ -652,3 +652,31 @@ def test_gate_closed_alone_does_not_lower_conviction_after_confirmation():
 def test_top_cluster_keeps_its_conviction():
     rec = _rec(30, "TOP CLUSTER (5 themes) — CUT", "High")
     assert K.apply_leverage_cap(rec, K.leverage_permission(_desk_state("OPEN", 0)))["conviction"] == "High"
+
+
+# --- SKEW is context, not core ---------------------------------------------
+def test_skew_is_not_a_core_rule():
+    assert "skew" not in R.CORE_RULES
+    rules = {r.key: r for r in R.capitulation_rules(_prices(1800))}
+    assert rules["skew"].core is False
+    assert {k for k, r in rules.items() if r.core} == set(R.CORE_RULES)
+
+
+def test_skew_firing_does_not_change_the_verdict():
+    p = _prices(1800)
+    hist = R.capitulation_history(p)
+    calm = hist.assign(**{c: False for c in hist.columns})
+    fired = calm.assign(skew=True)
+    a = R.capitulation_verdict(R.capitulation_rules(p, history=calm))
+    b = R.capitulation_verdict(R.capitulation_rules(p, history=fired))
+    assert a["core_fired"] == b["core_fired"] == 0
+    assert a["state"] == b["state"] == "QUIET"
+    assert b["all_fired"] == a["all_fired"] + 1  # still visible as context
+
+
+def test_backtest_buckets_ignore_skew():
+    p = _prices(1800)
+    hist = R.capitulation_history(p).astype(bool)
+    with_skew = R.capitulation_backtest(hist.assign(skew=True), R.px(p, "QQQ"))
+    without = R.capitulation_backtest(hist.assign(skew=False), R.px(p, "QQQ"))
+    pd.testing.assert_frame_equal(with_skew, without)

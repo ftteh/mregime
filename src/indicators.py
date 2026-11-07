@@ -224,7 +224,6 @@ def build_raw() -> RawFrame:
         "obos_os_pct": D.obos_oversold_pct,
 
         # ---- Sentiment & Positioning
-        "naaim": D.naaim_exposure,
         "aaii_bull_bear": _aaii_bull_bear_spread,
         "fear_greed": D.fear_greed_index,
         "put_call": D.put_call_ratio,
@@ -439,7 +438,7 @@ def per_indicator_history(raw: RawFrame) -> pd.DataFrame:
         if int(raw.meta.get(key, {}).get("n", 0)) < MIN_OBS:
             continue
         # Resample to business-day grid so pillar avg aligns across mixed frequencies.
-        # Some feeds (AAII/NAAIM/put-call cache) occasionally emit duplicate
+        # Some feeds (AAII/put-call cache) occasionally emit duplicate
         # timestamps; resample() then reindexes and raises on duplicates, so
         # dedupe first.
         s_d = s.copy()
@@ -478,7 +477,7 @@ def _carry_scores_to_edge(df: pd.DataFrame) -> pd.DataFrame:
     """Carry each indicator's LAST valid score forward to the frame's end date.
 
     Feeds publish on different lags (FRED's DGS10 a day behind yfinance, weekly
-    NAAIM/AAII/CTA/NFCI up to a week behind), so the final rows of the joint
+    AAII/CTA/NFCI up to a week behind), so the final rows of the joint
     frame are ragged. Without this, the historical pillar on those rows averages
     only the indicators that happened to print that day — e.g. the Valuation
     pillar swung from ~38 to ~0 when the daily NDX P/E printed a day after the

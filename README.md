@@ -14,7 +14,7 @@ positioning, vol, and valuation — all from **free data sources**.
 
 **Header** — one glance, one number:
 - Composite Regime Score gauge (0 = capitulation, 100 = euphoria)
-- SPX / VIX / HY Spread / F&G / NAAIM / AAII tiles
+- SPX / VIX / HY Spread / F&G / AAII tiles
 - **Cluster detector**: tells you when ≥4 indicators are in extreme territory
 
 **The Four Pillars** (institutional weights):
@@ -22,7 +22,7 @@ positioning, vol, and valuation — all from **free data sources**.
 |---|---|---|
 | Credit & Liquidity | 40% | HY/IG spreads, MOVE, Fed Net Liquidity (WALCL−TGA−RRP), NFCI |
 | Breadth & Momentum | 30% | % above 200DMA, new highs−lows, A/D line, SPX RSI, 10/20DMA trend breadth, 50D overbought−oversold spread |
-| Sentiment & Positioning | 20% | AAII, NAAIM, F&G, Put/Call, VIX, VVIX, SKEW |
+| Sentiment & Positioning | 20% | AAII, F&G, Put/Call, VIX, VVIX, SKEW |
 | Valuation | 10% | Equity Risk Premium, Nasdaq 100 trailing P/E |
 
 **Pro Watchlist** — the divergences that matter:
@@ -45,7 +45,7 @@ positioning, vol, and valuation — all from **free data sources**.
 
 **Decision desk** — four independent questions under Today's read, kept separate from the composite:
 - **Is the system intact?** Guardrails on breadth, participation, IG / HY / CCC credit, funding, correlation, NFCI
-- **Is fear washed out?** A capitulation checklist; the 7 core rules are backtested, the rest add context
+- **Is fear washed out?** A capitulation checklist; 6 core rules count toward the verdict, the rest add context
 - **Has price confirmed?** Panic gauges rolling over, QQQ reclaiming its averages, MOVE and yields falling
 - **Is leverage safe?** VIX futures crowding, index correlation, dealer gamma, VIX level. Plus the rotation stage
 
@@ -126,7 +126,6 @@ Cold starts can take **1–2 minutes** (downloads breadth data). The `cache/` pu
 | **Yahoo Finance** | ^VIX, ^VVIX, ^SKEW, ^GSPC, ^TNX, SPY, TLT, GLD, SP500 components, SPY options chain (put/call) | `yfinance` |
 | **CNN** | Fear & Greed Index (historical) | public JSON endpoint |
 | **Nasdaq Data Link** | AAII weekly sentiment (`AAII/AAII_SENTIMENT`) | API key — free, optional |
-| **NAAIM** | Active manager exposure (weekly) | scrape programs page for current XLSX URL |
 | **yfinance options** | Put/Call computed live from SPY options chain (put vol / call vol across 3 front expiries) | daily snapshot, cached to disk |
 | **SqueezeMetrics** | DIX (dark pool index) | public CSV |
 | **YCharts** | FINRA margin debt (monthly) — FINRA's own page/XLSX is Cloudflare-gated with no data feed | public indicator page (no key); bundled seed + disk cache fallback |
@@ -192,6 +191,7 @@ quant/
     ├── research_charts.py # Plotly builders for the research desk
     ├── desk.py            # Assembles rules, tables and the model posture
     ├── desk_ui.py         # Streamlit rendering for the decision and research desks
+    ├── backtest.py        # Daily rule histories and performance tools for scripts/backtest_rules.py
     └── seeds/             # Committed fallback history (regenerate: python -m scripts.refresh_seeds)
 ```
 
@@ -208,13 +208,15 @@ quant/
 - **Decision desk**: rule output from public data, not investment advice. The rules sit beside the composite and
   never change its score. Proxies are labelled: GVIP−SPY measures how crowded longs traded, not actual
   prime-book gross exposure, and MTUM−SPY is a long-only stand-in for long/short momentum.
+- **Rule testing**: `python -m scripts.backtest_rules` tests the decision rules against criteria fixed in advance
+  and writes `.claude/plan/rule-backtest-results.md`. The cap passed as risk control. The capitulation count failed
+  on untouched 2003–2016 data, so don't read a washout as evidence of a bottom.
 - **Event studies**: permutation p-values on overlapping crisis events, across many signals and horizons. Some rows
   will clear p ≤ 0.05 by chance, and thin buckets are flagged. Treat them as evidence, not forecasts.
 - **CFTC**: as of Tuesday, published Friday. Backtests lag flags to publication. Leveraged-fund Treasury shorts are
   largely the basis trade, so read the 3-year percentile alongside the all-time one.
 - **ICE credit spreads on FRED**: only about 3 years are served, so older history depends on the local cache and seed.
 - **Put/Call**: official Cboe ratios. An ETF-chain proxy only fills a day with no official row yet, and is flagged.
-- **NAAIM**: the publisher moved its history behind a login, so this feed currently returns nothing.
 - **Breadth**: computed across all ~503 current S&P 500 constituents (one 5-year bulk download,
   ~15s), equal-weighted. Uses current membership, so history carries survivorship bias.
 - **Nasdaq 100 forward P/E**: Bloomberg's BEst series is paid. The free forward history (VCP Scanner)
