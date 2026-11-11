@@ -459,57 +459,80 @@ def test_figures_tolerate_empty_series():
 
 # --- reconciliation regressions -------------------------------------------
 def test_cta_positioning_uses_the_e_mini_contract_not_micro(monkeypatch):
-    """The name filter also matched the Micro contract, which sat on the other side."""
-    import io
-    import zipfile
-    from src import data as D
-
-    csv = (
-        "Market_and_Exchange_Names,As_of_Date_In_Form_YYMMDD,CFTC_Contract_Market_Code,"
-        "Lev_Money_Positions_Long_All,Lev_Money_Positions_Short_All,Open_Interest_All\n"
-        '"E-MINI S&P 500 - CHICAGO MERCANTILE EXCHANGE",261103,13874A,100,500,1000\n'
-        '"MICRO E-MINI S&P 500 INDEX - CHICAGO MERCANTILE EXCHANGE",261103,13874U,300,100,1000\n'
-    )
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w") as z:
-        z.writestr("FinFutYY.txt", csv)
+    """The name filter also matched the Micro contract, which sat on the other side.
+    The scored series now comes from the research feed, which filters by code."""
+    es = next(m for m in RD.COT_MARKETS if m["key"] == "ES")
+    assert es["code"] == "13874A" and es["side"] == "lev"
+    seen = {}
 
     class Resp:
-        ok = True
-        content = buf.getvalue()
+        def raise_for_status(self):
+            pass
 
-    monkeypatch.setattr(D.requests, "get", lambda *a, **k: Resp())
+        def json(self):
+            return [{"d": "2026-11-03T00:00:00.000", "l": "100", "s": "500", "oi": "1000"}]
+
+    def fake_get(url, params=None, **k):
+        seen["where"] = params["$where"]
+        return Resp()
+
+    monkeypatch.setattr(RD.requests, "get", fake_get)
+    out = RD._fetch_cot_dataset(RD.TFF, [es])
+    assert seen["where"] == "cftc_contract_market_code='13874A'"
+    assert out["ES"].iloc[-1] == pytest.approx(-40.0)
+
+
+def test_scored_cta_series_is_the_research_desk_series(monkeypatch):
+    """One feed for both, so the composite and the positioning table can't disagree."""
+    from src import data as D
+    idx = pd.date_range("2024-01-02", periods=3, freq="W-TUE")
+    frame = pd.DataFrame({"ES": [-5.0, -12.0, -18.7], "VIX": [1.0, 2.0, 3.0]}, index=idx)
+    monkeypatch.setattr(RD, "cot_positioning", lambda: frame)
+    D.reset_fetch_memo()
+    D.record_provenance("cot_positioning", "bundled_seed", kind="fallback", note="seed through 2026-10-27")
     s = D.cftc_cta_positioning()
-    assert s.iloc[-1] == pytest.approx(-40.0)
+    assert s.tolist() == [-5.0, -12.0, -18.7] and s.name == "cta_positioning"
+    # A seed-served feed must not read as live in the indicator table.
+    assert D.get_provenance()["cta_positioning"]["kind"] == "fallback"
+    monkeypatch.setattr(RD, "cot_positioning", lambda: pd.DataFrame())
+    assert D.cftc_cta_positioning().empty
+    assert D.get_provenance()["cta_positioning"]["kind"] == "unavailable"
+    D.reset_fetch_memo()
 
 
-def _stub_put_call(monkeypatch, *, cache, daily, live=9.9):
+def _stub_put_call(monkeypatch, *, daily, archive=None, ycharts=None):
     from src import data as D
     empty = pd.Series(dtype=float)
-    monkeypatch.setattr(D, "_cboe_put_call_history", lambda k, n: empty)
-    monkeypatch.setattr(D, "_ycharts_recent_indicator", lambda s, n: empty)
-    monkeypatch.setattr(D, "_load_series_cache", lambda f, n: cache)
-    monkeypatch.setattr(D, "_save_series_cache", lambda *a: None)
+    monkeypatch.setattr(D, "_cboe_put_call_history", lambda k, n: empty if archive is None else archive)
+    monkeypatch.setattr(D, "_ycharts_recent_indicator", lambda s, n: empty if ycharts is None else ycharts)
     monkeypatch.setattr(D, "_cboe_daily_ratio", lambda k, n: daily)
-    monkeypatch.setattr(D, "_cboe_live_put_call_ratio", lambda s: live)
+    monkeypatch.setattr(D, "_closed_only", lambda obj, label=None: obj)
     return D
 
 
-def test_official_daily_ratio_replaces_cached_proxy_rows(monkeypatch):
+def test_put_call_series_is_official_rows_only(monkeypatch):
+    """A day Cboe hasn't published stays missing. It used to be filled with an
+    SPY/QQQ/IWM chain ratio (about 1.2) that ranked as a record panic against
+    the equity-only history (about 0.6)."""
     day = pd.Timestamp("2026-11-06")
-    D = _stub_put_call(monkeypatch, cache=pd.Series([1.126], index=[day]), daily=pd.Series([0.59], index=[day]))
-    monkeypatch.setattr(D, "last_completed_trading_day", lambda: day)
-    out = D._official_put_call_series(kind="equity", ycharts_slug="x", name="put_call", cache_filename="f", live_symbols=("SPY",))
-    assert out.iloc[-1] == pytest.approx(0.59)
+    D = _stub_put_call(monkeypatch, daily=pd.Series([0.6], index=[day - pd.Timedelta(days=1)]))
+    out = D._official_put_call_series(kind="equity", ycharts_slug="x", name="pc_test")
+    assert out.index[-1] == day - pd.Timedelta(days=1) and out.iloc[-1] == pytest.approx(0.6)
+    assert D.get_provenance()["pc_test"]["kind"] == "primary"
+    assert not hasattr(D, "_cboe_live_put_call_ratio")
 
 
-def test_proxy_only_fills_a_day_with_no_official_row(monkeypatch):
+def test_cboe_daily_file_overrides_a_ycharts_copy(monkeypatch):
     day = pd.Timestamp("2026-11-06")
-    D = _stub_put_call(monkeypatch, cache=pd.Series(dtype=float), daily=pd.Series([0.6], index=[day - pd.Timedelta(days=1)]))
-    monkeypatch.setattr(D, "last_completed_trading_day", lambda: day)
-    out = D._official_put_call_series(kind="equity", ycharts_slug="x", name="pc_test", cache_filename="f", live_symbols=("SPY",))
-    assert out.iloc[-1] == pytest.approx(9.9)
-    assert D.get_provenance()["pc_test"]["kind"] == "fallback"
+    D = _stub_put_call(monkeypatch, daily=pd.Series([0.59], index=[day]), ycharts=pd.Series([0.61], index=[day]))
+    out = D._official_put_call_series(kind="equity", ycharts_slug="x", name="pc_test")
+    assert out.loc[day] == pytest.approx(0.59)
+
+
+def test_put_call_unavailable_when_no_official_source(monkeypatch):
+    D = _stub_put_call(monkeypatch, daily=pd.Series(dtype=float))
+    assert D._official_put_call_series(kind="index", ycharts_slug="x", name="pc_test").empty
+    assert D.get_provenance()["pc_test"]["kind"] == "unavailable"
 
 
 def test_cboe_daily_ratio_by_kind(monkeypatch):
@@ -566,6 +589,29 @@ def test_desk_freshness_flags_saved_and_stale_data():
     assert "saved data" in K.desk_freshness(seed, {"Prices": pd.Timestamp("2026-11-06")}, today)["issues"][0]
     assert "stale" in K.desk_freshness(live, {"Prices": pd.Timestamp("2026-10-20")}, today)["issues"][0]
     assert "no price data" in K.desk_freshness(live, {"Prices": None}, today)["issues"]
+
+
+def test_desk_freshness_checks_every_dated_feed():
+    """A CFTC report that stopped publishing must not pass as current."""
+    today = pd.Timestamp("2026-11-07")
+    live = {k: {"kind": "primary"} for k in K.KEY_FEEDS}
+    fresh = {"Prices": pd.Timestamp("2026-11-06"), "CFTC": pd.Timestamp("2026-10-27"), "Cboe": pd.Timestamp("2026-11-05"),
+             "Credit": pd.Timestamp("2026-11-04"), "Gamma": pd.Timestamp("2026-11-05")}
+    assert K.desk_freshness(live, fresh, today)["issues"] == []   # 11 days is normal for CFTC
+    old = K.desk_freshness(live, {**fresh, "CFTC": pd.Timestamp("2026-09-29"), "Gamma": pd.Timestamp("2026-08-01")}, today)["issues"]
+    assert any(i.startswith("CFTC data is stale") for i in old) and any(i.startswith("Gamma data is stale") for i in old)
+
+
+def test_funding_guardrail_needs_a_positive_spread_as_well_as_a_high_rank():
+    """A rank alone fails 5% of days by construction. In a year when SOFR sat
+    under fed funds, a spread of zero is the top of the range and is not stress."""
+    idx = pd.bdate_range("2025-01-01", periods=300)
+    calm = pd.Series(np.r_[np.full(290, -6.0), np.full(10, 0.0)], index=idx)
+    stressed = pd.Series(np.r_[np.full(290, 2.0), np.full(10, 30.0)], index=idx)
+    kw = dict(trend_breadth=None, pct_200=None, ig=None, hy=None, ccc=None, spx_corr=None, nfci=None)
+    rule = lambda s: {r.key: r for r in R.system_guardrails(sofr_spread=s, **kw)}["funding"]
+    assert rule(calm).fired            # top of its range, but at zero: holds
+    assert not rule(stressed).fired    # high rank AND a real spread: fails
 
 
 # --- exposure leverage cap -------------------------------------------------

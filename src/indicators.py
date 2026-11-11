@@ -16,10 +16,17 @@ import pandas as pd
 
 from . import data as D
 from .config import (
+    BUCKET_MIN_COVERAGE,
     BUCKET_WEIGHTS,
+    CLUSTER_NET_SHARE,
+    EXTREME_BOTTOM,
+    EXTREME_TOP,
     INDICATORS_BY_KEY,
     MIN_OBS,
+    MODEL_MIN_COVERAGE,
+    PCT_MIN_PERIODS,
     ROLLING_WINDOW_DAYS,
+    IndicatorSpec,
     theme_for,
 )
 
@@ -29,30 +36,36 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Normalization
 # ---------------------------------------------------------------------------
-def rolling_percentile(s: pd.Series, window: int = ROLLING_WINDOW_DAYS) -> pd.Series:
-    """Return rolling percentile rank (0-100) of s over `window` observations.
+def rolling_percentile(
+    s: pd.Series, window: int = ROLLING_WINDOW_DAYS, min_periods: int = PCT_MIN_PERIODS
+) -> pd.Series:
+    """Percentile rank (0-100) of each observation within its trailing `window`.
 
-    Equivalent to ranking the current observation against the trailing window via
-    ``(x <= x[-1]).mean() * 100``. Implemented with the vectorized C-level
-    ``Rolling.rank`` (method="max" counts ties as values <= current, matching the
-    ``<=`` comparison) instead of a Python-level apply — same result, ~10x faster.
+    Equivalent to ``(x <= x[-1]).mean() * 100`` over the window, via the
+    vectorized ``Rolling.rank`` (method="max" counts ties as values <= current).
+
+    The window grows from `min_periods` to `window` observations and then rolls,
+    so a series with three years of history gets a true three-year rank. The
+    engine used to halve the window for anything under six years long: HY and IG
+    spreads were ranked over 18 months, and Fear & Greed over six. Less than
+    `min_periods` of history gives no score at all.
     """
     if s is None or s.empty:
         return pd.Series(dtype=float)
-    win = min(window, max(30, len(s) // 2 if len(s) > 60 else len(s)))
-    return s.rolling(win, min_periods=max(30, win // 4)).rank(
+    return s.rolling(window, min_periods=min(min_periods, window)).rank(
         pct=True, method="max"
     ) * 100.0
 
 
 def latest_percentile(s: pd.Series, window: int = ROLLING_WINDOW_DAYS) -> float:
-    """Cheap single-value percentile (current value vs last `window` obs)."""
+    """Single-value percentile (current value vs the last `window` obs), for
+    charts of series that aren't scored. Ties count as <=, like the engine."""
     if s is None or s.empty:
         return np.nan
     tail = s.tail(window).dropna()
     if tail.empty:
         return np.nan
-    return float((tail.rank(pct=True).iloc[-1]) * 100.0)
+    return float((tail <= tail.iloc[-1]).mean() * 100.0)
 
 
 def orient_score(pct: float, direction: str) -> float:
@@ -119,6 +132,9 @@ class RawFrame:
     # cache rows). Charts may render them visibly distinct; they never enter
     # scoring/MIN_OBS/cluster. Default keeps 2-arg construction (tests) valid.
     display: Dict[str, pd.Series] = field(default_factory=dict)
+    # Quotes from a session still in progress, keyed by ticker. Shown as live
+    # context; never scored (see src/session.py).
+    live: Dict[str, dict] = field(default_factory=dict)
 
 
 def _empty_series(name: str = "") -> pd.Series:
@@ -160,26 +176,25 @@ def _fetch_parallel(tasks: dict[str, Callable[[], pd.Series]]) -> Dict[str, pd.S
 
 
 def _ad_line_proxy() -> pd.Series:
-    """A/D line proxy: sign of daily returns across all S&P 500 constituents.
+    """Cumulative advance-decline line across all S&P 500 constituents.
 
-    Reuses the shared full-constituent close panel instead of issuing its own
-    bulk download. The 1-year tail reproduces the original period="1y" input
-    to the cumulative advance-decline calculation.
+    Built over the whole shared close panel (about five years). It used to be
+    restarted from zero over the last 252 sessions, which left six months of
+    usable history and made the level depend on where the year happened to
+    start. The config z-scores it against its own one-year trend.
     """
     try:
         panel, wanted = D._panel_columns()
         if not wanted:
             D.record_provenance("ad_line_slope", "", kind="unavailable")
             return _empty_series("ad_line_slope")
-        closes = panel[wanted].tail(252)  # ~1 trading year
-        rets = closes.pct_change()
-        ad = (rets > 0).sum(axis=1) - (rets < 0).sum(axis=1)
-        ad.name = "ad_line_slope"
+        rets = panel[wanted].pct_change(fill_method=None).iloc[1:]
+        ad = ((rets > 0).sum(axis=1) - (rets < 0).sum(axis=1)).astype(float)
         D.record_provenance(
             "ad_line_slope", f"sp500_panel({len(wanted)} constituents)", kind="computed",
             note="A/D proxy from current S&P 500 membership, not NYSE official",
         )
-        return ad.cumsum()
+        return ad.cumsum().rename("ad_line_slope")
     except Exception as e:
         log.info("A/D line proxy failed: %s", str(e)[:120])
         return _empty_series("ad_line_slope")
@@ -273,6 +288,11 @@ def build_raw() -> RawFrame:
     }
     s.update(_fetch_parallel(tasks))
 
+    # One clock for every feed. Yahoo's unfinished bar is already dropped at the
+    # fetch; this also covers a same-day print from any other source or a saved
+    # row, so "scores through <date>" is true of every input, not only prices.
+    s = {k: D._closed_only(v) for k, v in s.items()}
+
     spx_px = s.get("spx", _empty_series("spx"))
     s["rsi_spx"] = rsi(spx_px, 14) if not spx_px.empty else pd.Series(dtype=float)
 
@@ -294,42 +314,243 @@ def build_raw() -> RawFrame:
     for k in s:
         meta.setdefault(k, {})["provenance"] = prov.get(k)
 
-    return RawFrame(series=s, meta=meta, display=D.get_display_overlays())
+    return RawFrame(series=s, meta=meta, display=D.get_display_overlays(), live=D.get_live_quotes())
 
 
 # ---------------------------------------------------------------------------
-# Composite scoring
+# Scoring engine
 # ---------------------------------------------------------------------------
+# One prepared, business-daily history per indicator (per_indicator_history) and
+# one aggregator (aggregate_scores). The live gauge reads the last row of the
+# same frame the regime-band chart is drawn from, so the two cannot disagree.
+ACTIVE_MIN_OBS = 20  # active readings needed before an event flag is ranked
+
+
+def _scored_specs() -> Dict[str, IndicatorSpec]:
+    return {k: sp for k, sp in INDICATORS_BY_KEY.items() if not sp.display_only}
+
+
+def _ffill_limit(spec: IndicatorSpec) -> int:
+    """Business days a print may be carried forward: its staleness allowance."""
+    return int(np.ceil(spec.max_stale_days * 5.0 / 7.0)) + 1
+
+
+def _business_daily(s: pd.Series, limit: int | None = None) -> pd.Series:
+    """One value per business day, the last print carried forward at most `limit` days.
+
+    A weekend-dated print (a month-end P/E, say) first shows on the next business
+    day. Gaps longer than `limit` stay empty instead of becoming a flat line of
+    one old value.
+    """
+    out = s.copy()
+    if not isinstance(out.index, pd.DatetimeIndex):
+        out.index = pd.to_datetime(out.index, errors="coerce")
+        out = out[out.index.notna()]
+    if out.empty:
+        return pd.Series(dtype=float)
+    if getattr(out.index, "tz", None) is not None:
+        out.index = out.index.tz_localize(None)
+    out.index = out.index.normalize()
+    out = pd.to_numeric(out, errors="coerce").dropna().sort_index()
+    out = out[~out.index.duplicated(keep="last")]
+    if out.empty:
+        return pd.Series(dtype=float)
+    grid = pd.bdate_range(out.index[0], pd.offsets.BDay().rollforward(out.index[-1]))
+    return out.reindex(grid, method="ffill", limit=limit)
+
+
+def _prepared(key: str, spec: IndicatorSpec, raw: RawFrame) -> pd.Series | None:
+    """The series the percentile is taken of: business-daily and smoothed."""
+    s = raw.series.get(key)
+    if s is None or s.empty:
+        return None
+    # Single min-observation gate, enforced here so the live score (last row)
+    # and the historical chart exclude exactly the same thin indicators.
+    if int(raw.meta.get(key, {}).get("n", 0)) < MIN_OBS:
+        return None
+    try:
+        x = _business_daily(s, _ffill_limit(spec))
+    except Exception:
+        return None  # a malformed feed drops out; it doesn't take the panel down
+    if x.empty:
+        return None
+    if spec.smooth > 1:
+        x = x.rolling(spec.smooth, min_periods=max(1, spec.smooth // 2)).mean().where(x.notna())
+    return x
+
+
+def _active_only_score(x: pd.Series, direction: str) -> pd.Series:
+    """Score for an event flag that reads exactly 0 while it is off.
+
+    Off = 50 (no vote either way). On = 50 to 100 by rank among the active
+    readings of the trailing window, or 50 down to 0 for a contrarian flag.
+    Ranking the raw series instead scored "off" as the share of zeros in the
+    window: an arbitrary number that could reach an extreme with the flag off.
+    """
+    active = x.where(x > 0)
+    pct = active.rolling(ROLLING_WINDOW_DAYS, min_periods=ACTIVE_MIN_OBS).rank(pct=True, method="max") * 100.0
+    on = 50.0 + pct / 2.0 if direction == "risk_high_is_top" else 50.0 - pct / 2.0
+    score = on.where(x > 0, 50.0).where(x.notna())
+    return score.where(x.notna().cumsum() >= PCT_MIN_PERIODS)
+
+
+def _score_history(x: pd.Series, spec: IndicatorSpec) -> pd.Series:
+    if spec.transform == "active_only":
+        return _active_only_score(x, spec.direction)
+    pct = rolling_percentile(apply_transform(x, spec.transform, spec.transform_window))
+    if spec.transform == "stress_only":
+        # Below the window median every reading ties at the median: no vote.
+        pct = pct.clip(lower=50.0)
+    return 100.0 - pct if spec.direction == "contrarian_high_is_top" else pct
+
+
+def per_indicator_history(raw: RawFrame) -> pd.DataFrame:
+    """
+    Daily (business-day) DataFrame, one column per scored indicator, values = the
+    oriented 0-100 top-risk score over time. Built only from past data via
+    rolling_percentile (point-in-time, no look-ahead).
+
+    This is the single source of truth for scoring: the live gauge reads the
+    last row (see score_indicators) and the regime-band chart / pillar momentum
+    aggregate the full history. Indicators with too little history stay NaN and
+    are excluded everywhere downstream; so does one whose last print is older
+    than its staleness allowance.
+    """
+    cols: Dict[str, pd.Series] = {}
+    for key, spec in _scored_specs().items():
+        x = _prepared(key, spec, raw)
+        if x is not None:
+            cols[key] = _score_history(x, spec)
+    if not cols:
+        return pd.DataFrame()
+    return _carry_scores_to_edge(
+        pd.DataFrame(cols), {k: INDICATORS_BY_KEY[k].max_stale_days for k in cols}
+    )
+
+
+def _carry_scores_to_edge(df: pd.DataFrame, max_stale_days: Dict[str, int] | None = None) -> pd.DataFrame:
+    """Carry each indicator's LAST valid score forward to the frame's end date.
+
+    Feeds publish on different lags (FRED a day behind yfinance, weekly
+    AAII/CTA/NFCI up to a week behind), so the final rows of the joint frame are
+    ragged. Carrying the last known reading forward is point-in-time correct (it
+    was the latest information on those days) and keeps the chart endpoint,
+    pillar momentum and the gauge in agreement. Only the trailing edge is
+    filled; interior gaps are left untouched.
+
+    With `max_stale_days`, a reading older than its allowance is NOT carried: a
+    feed that died weeks ago stops voting instead of repeating its last score
+    at full weight.
+    """
+    if df.empty:
+        return df
+    out = df.copy()
+    edge = out.index[-1]
+    for col in out.columns:
+        last = out[col].last_valid_index()
+        if last is None or last == edge:
+            continue
+        allowed = (max_stale_days or {}).get(col)
+        if allowed is not None and (edge - last).days > allowed:
+            continue
+        out.loc[out.index > last, col] = out.at[last, col]
+    return out
+
+
+def aggregate_scores(per_ind: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
+    """(pillar scores, composite, model coverage) by date.
+
+    Within a pillar, indicators are averaged by their config weight. A pillar is
+    scored only when at least BUCKET_MIN_COVERAGE of its indicator weight is
+    live, so one surviving feed can't stand in for the whole pillar. Coverage is
+    the share of the model's weight that is live, counted indicator by indicator;
+    below MODEL_MIN_COVERAGE there is no composite.
+    """
+    empty = (pd.DataFrame(), pd.Series(dtype=float, name="composite"), pd.Series(dtype=float, name="coverage"))
+    if per_ind is None or per_ind.empty:
+        return empty
+    pillars: Dict[str, pd.Series] = {}
+    cover: Dict[str, pd.Series] = {}
+    specs = _scored_specs()
+    for bkey in BUCKET_WEIGHTS:
+        members = {k: sp for k, sp in specs.items() if sp.bucket == bkey}
+        total = float(sum(sp.weight for sp in members.values()))
+        cols = [k for k in members if k in per_ind.columns]
+        if not cols or total <= 0:
+            continue
+        w = np.array([members[c].weight for c in cols], dtype=float)
+        sub = per_ind[cols]
+        live_w = (sub.notna() * w).sum(axis=1)
+        cov = live_w / total
+        score = (sub.fillna(0.0) * w).sum(axis=1) / live_w.replace(0, np.nan)
+        pillars[bkey] = score.where(cov >= BUCKET_MIN_COVERAGE)
+        cover[bkey] = cov
+    if not pillars:
+        return empty
+    P, C = pd.DataFrame(pillars), pd.DataFrame(cover)
+    bw = pd.Series(BUCKET_WEIGHTS, dtype=float)
+    w = bw.reindex(P.columns)
+    valid = P.notna()
+    comp = P.fillna(0.0).mul(w, axis=1).sum(axis=1) / valid.mul(w, axis=1).sum(axis=1).replace(0, np.nan)
+    coverage = C.where(valid, 0.0).mul(w, axis=1).sum(axis=1) / float(bw.sum())
+    comp = comp.where(coverage >= MODEL_MIN_COVERAGE)
+    return P, comp.rename("composite"), coverage.rename("coverage")
+
+
 def score_indicators(raw: RawFrame, per_indicator: pd.DataFrame | None = None) -> pd.DataFrame:
-    """Return DataFrame: key | label | bucket | raw | percentile | score | direction.
+    """One row per indicator: raw value, percentile, oriented score and why it
+    is or isn't voting.
 
-    The live score is the most recent point of per_indicator_history (same engine
-    as the regime-band chart), so the gauge endpoint matches the chart endpoint
-    and weekly/daily indicators share one calendar window. Indicators below
-    MIN_OBS observations — or whose history is too short for the percentile's
-    min_periods — resolve to NaN and are dropped from the composite and cluster.
+    The live score is the last row of per_indicator_history (same engine as the
+    regime-band chart). `status` says why a score is missing:
+      display  charted only, by design
+      offline  no data
+      thin     fewer than MIN_OBS observations
+      warmup   under a year of history, so no percentile yet
+      stale    last print older than the indicator's allowance
     """
     df = per_indicator_history(raw) if per_indicator is None else per_indicator
+    have = df is not None and not df.empty
+    edge = df.index[-1] if have else None
     rows = []
     for key, spec in INDICATORS_BY_KEY.items():
         series = raw.series.get(key, pd.Series(dtype=float))
-        raw_value = float(series.iloc[-1]) if series is not None and not series.empty else np.nan
-        n_obs = int(raw.meta.get(key, {}).get("n", 0))
+        has = series is not None and not series.empty
+        raw_value = float(series.iloc[-1]) if has else np.nan
+        meta = raw.meta.get(key, {})
+        n_obs = int(meta.get("n", 0))
+        as_of = meta.get("as_of")
 
-        score = np.nan
-        if df is not None and not df.empty and key in df.columns and n_obs >= MIN_OBS:
-            col = df[key].dropna()
-            if not col.empty:
-                score = float(col.iloc[-1])
+        score, status = np.nan, "ok"
+        if spec.display_only:
+            status = "display"
+        elif not has:
+            status = "offline"
+        elif n_obs < MIN_OBS or not have or key not in df.columns:
+            status = "thin"
+        else:
+            v = df[key].iloc[-1]
+            if pd.notna(v):
+                score = float(v)
+            elif as_of is not None and (edge - pd.Timestamp(as_of).normalize()).days > spec.max_stale_days:
+                status = "stale"
+            else:
+                status = "warmup"
+
         # Back-derive the displayed percentile from the oriented score.
-        if np.isnan(score):
+        if np.isnan(score) or spec.transform == "active_only":
             pct = np.nan
         elif spec.direction == "contrarian_high_is_top":
             pct = 100.0 - score
         else:
             pct = score
 
-        prov = raw.meta.get(key, {}).get("provenance") or {}
+        window_years = np.nan
+        if has and isinstance(series.index, pd.DatetimeIndex):
+            n_b = int(np.busday_count(series.index[0].date(), series.index[-1].date())) + 1
+            window_years = min(ROLLING_WINDOW_DAYS, n_b) / 252.0
+
+        prov = meta.get("provenance") or {}
         rows.append({
             "key": key,
             "label": spec.label,
@@ -340,8 +561,11 @@ def score_indicators(raw: RawFrame, per_indicator: pd.DataFrame | None = None) -
             "score": score,
             "weight": spec.weight,
             "theme": theme_for(key),
-            "as_of": raw.meta.get(key, {}).get("as_of"),
+            "as_of": as_of,
             "n_obs": n_obs,
+            "status": status,
+            "window_years": window_years,
+            "max_stale_days": spec.max_stale_days,
             "source_used": prov.get("source"),
             "source_kind": prov.get("kind"),
             "source_note": prov.get("note"),
@@ -350,57 +574,89 @@ def score_indicators(raw: RawFrame, per_indicator: pd.DataFrame | None = None) -
 
 
 def composite(scores_df: pd.DataFrame) -> dict:
-    """Compute weighted composite score + per-bucket scores."""
-    bucket_scores = {}
-    for bucket, weight in BUCKET_WEIGHTS.items():
-        sub = scores_df[scores_df["bucket"] == bucket].dropna(subset=["score"])
-        if sub.empty:
-            bucket_scores[bucket] = {"score": np.nan, "weight": weight, "n": 0}
-            continue
-        # Indicator-level equal weight within bucket (can use sub['weight'])
-        w = sub["weight"].fillna(1.0)
-        score = float(np.average(sub["score"].values, weights=w.values))
-        bucket_scores[bucket] = {"score": score, "weight": weight, "n": int(len(sub))}
+    """Weighted composite + per-pillar scores from a scores table.
 
-    valid = [b for b in bucket_scores.values() if not np.isnan(b["score"])]
-    all_weight = sum(BUCKET_WEIGHTS.values())
-    covered_weight = (sum(b["weight"] for b in valid) / all_weight) if all_weight else 0.0
-    if not valid:
-        return {"composite": np.nan, "buckets": bucket_scores, "covered_weight": 0.0}
-    total_w = sum(b["weight"] for b in valid)
-    comp = sum(b["score"] * b["weight"] for b in valid) / total_w
-    return {
-        "composite": float(comp),
-        "buckets": bucket_scores,
-        # Fraction of the model's total bucket weight that actually has data.
-        # < 1.0 means the composite was renormalised over a partial model (e.g.
-        # no FRED key → the 40% Credit pillar is dark) — surfaced as confidence.
-        "covered_weight": float(covered_weight),
-    }
+    Runs the same aggregator as the history, on a one-row frame, so the gauge and
+    the chart endpoint are the same arithmetic. `covered_weight` is the share of
+    the model's indicator weight that is live (not just the share of pillars
+    with at least one indicator).
+    """
+    buckets = {b: {"score": np.nan, "weight": w, "n": 0, "coverage": 0.0} for b, w in BUCKET_WEIGHTS.items()}
+    out = {"composite": np.nan, "buckets": buckets, "covered_weight": 0.0}
+    if scores_df is None or scores_df.empty or "score" not in scores_df.columns:
+        return out
+    row = scores_df.drop_duplicates("key").set_index("key")["score"].astype(float)
+    frame = pd.DataFrame([row.values], columns=row.index)
+    pillars, comp, coverage = aggregate_scores(frame)
+    specs = _scored_specs()
+    for b, info in buckets.items():
+        members = {k: sp for k, sp in specs.items() if sp.bucket == b}
+        live = [k for k in members if k in row.index and pd.notna(row[k])]
+        total = float(sum(sp.weight for sp in members.values()))
+        info["n"] = len(live)
+        info["coverage"] = float(sum(members[k].weight for k in live) / total) if total else 0.0
+        if b in pillars.columns and pd.notna(pillars[b].iloc[0]):
+            info["score"] = float(pillars[b].iloc[0])
+    out["covered_weight"] = float(coverage.iloc[0]) if len(coverage) else 0.0
+    if len(comp) and pd.notna(comp.iloc[0]):
+        out["composite"] = float(comp.iloc[0])
+    return out
 
 
 # ---------------------------------------------------------------------------
 # Cluster detection — "are we in a confluence top/bottom?"
 # ---------------------------------------------------------------------------
-def cluster_signal(scores_df: pd.DataFrame) -> dict:
-    """Detect a confluence of extremes — counting independent THEMES, not raw
-    indicators, so a single vol event (VIX/VVIX/SKEW/term-structure all firing)
-    counts once rather than four times. Also reports how many buckets the
-    extremes span, so the override can require cross-pillar confirmation.
+def cluster_need(themes_live: int) -> int:
+    """Net themes at one extreme that make a cluster: a third of the live themes."""
+    return max(CLUSTER_MIN_THEMES, int(np.ceil(themes_live * CLUSTER_NET_SHARE)))
+
+
+def cluster_side(cluster: dict | None) -> str | None:
+    """'top', 'bottom' or None: is one extreme lopsided enough to be a cluster?
+
+    Themes at one extreme minus themes at the other must reach `need`, and the
+    winning side must span CLUSTER_MIN_BUCKETS pillars. Opposing extremes
+    cancel: nine themes washed out next to nine stretched is a divided market,
+    not a signal in either direction.
     """
-    extreme_top = scores_df[scores_df["score"] >= 85]
-    extreme_bot = scores_df[scores_df["score"] <= 15]
+    if not cluster:
+        return None
+    top = int(cluster.get("top_theme_count", cluster.get("top_cluster_count", 0)))
+    bot = int(cluster.get("bottom_theme_count", cluster.get("bottom_cluster_count", 0)))
+    # A dict from an older caller has no theme count: assume the whole model is live.
+    live = int(cluster.get("themes_live") or len({theme_for(k) for k in _scored_specs()}))
+    need = int(cluster.get("need") or cluster_need(live))
+    if top - bot >= need and len(cluster.get("top_buckets", [])) >= CLUSTER_MIN_BUCKETS:
+        return "top"
+    if bot - top >= need and len(cluster.get("bottom_buckets", [])) >= CLUSTER_MIN_BUCKETS:
+        return "bottom"
+    return None
+
+
+def cluster_signal(scores_df: pd.DataFrame) -> dict:
+    """Count the independent THEMES at each extreme, and say whether the
+    extremes are lopsided enough to call a cluster.
+
+    Themes, not raw indicators, so a single vol event (VIX/VVIX/SKEW/term
+    structure all firing) counts once rather than four times. "Extreme" is
+    relative: a score beyond EXTREME_TOP / EXTREME_BOTTOM against the
+    indicator's own last three years, not an absolute stress level.
+    """
+    extreme_top = scores_df[scores_df["score"] >= EXTREME_TOP]
+    extreme_bot = scores_df[scores_df["score"] <= EXTREME_BOTTOM]
+    scored = scores_df.dropna(subset=["score"])
 
     def _themes(df: pd.DataFrame) -> int:
         if df.empty or "theme" not in df.columns:
             return int(len(df))
         return int(df["theme"].nunique())
 
-    return {
+    live = _themes(scored)
+    out = {
         # Raw indicator counts (kept for display continuity)
         "top_cluster_count": int(len(extreme_top)),
         "bottom_cluster_count": int(len(extreme_bot)),
-        # De-duplicated independent-theme counts (drive the override)
+        # De-duplicated independent-theme counts
         "top_theme_count": _themes(extreme_top),
         "bottom_theme_count": _themes(extreme_bot),
         # Cross-pillar breadth of the extremes
@@ -408,110 +664,17 @@ def cluster_signal(scores_df: pd.DataFrame) -> dict:
         "bottom_buckets": sorted(extreme_bot["bucket"].unique().tolist()),
         "top_names": extreme_top["label"].tolist(),
         "bottom_names": extreme_bot["label"].tolist(),
+        "themes_live": live,
+        "need": cluster_need(live),
     }
-
-
-# ---------------------------------------------------------------------------
-# Historical composite — reconstruct the regime score over time
-# ---------------------------------------------------------------------------
-def per_indicator_history(raw: RawFrame) -> pd.DataFrame:
-    """
-    Daily (business-day) DataFrame, one column per indicator, values = the
-    oriented 0-100 top-risk score over time. Built purely from past data via
-    rolling_percentile (point-in-time, no look-ahead).
-
-    This is the single source of truth for scoring: the live gauge reads the
-    last row (see score_indicators) and the regime-band chart / pillar momentum
-    aggregate the full history — so the gauge can never disagree with the chart
-    endpoint. Indicators with too little history (min_periods) stay NaN and are
-    excluded everywhere downstream.
-    """
-    per_indicator: Dict[str, pd.Series] = {}
-    for key, spec in INDICATORS_BY_KEY.items():
-        s = raw.series.get(key, pd.Series(dtype=float))
-        if s is None or s.empty:
-            continue
-        # Single min-observation gate, enforced here so the live scores (last row)
-        # and the historical chart exclude exactly the same thin indicators —
-        # otherwise a 30-59-obs series would be gated live but counted on the
-        # chart, breaking the gauge==chart-endpoint guarantee.
-        if int(raw.meta.get(key, {}).get("n", 0)) < MIN_OBS:
-            continue
-        # Resample to business-day grid so pillar avg aligns across mixed frequencies.
-        # Some feeds (AAII/put-call cache) occasionally emit duplicate
-        # timestamps; resample() then reindexes and raises on duplicates, so
-        # dedupe first.
-        s_d = s.copy()
-        # Ensure DatetimeIndex — some fallback fetchers can emit string/int indices
-        if not isinstance(s_d.index, pd.DatetimeIndex):
-            try:
-                s_d.index = pd.to_datetime(s_d.index, errors="coerce")
-                s_d = s_d[s_d.index.notna()]
-                if s_d.empty or not isinstance(s_d.index, pd.DatetimeIndex):
-                    continue
-            except Exception:
-                continue
-        # Strip timezone for resample
-        if getattr(s_d.index, "tz", None) is not None:
-            s_d.index = s_d.index.tz_localize(None)
-        s_d = s_d.sort_index()
-        s_d = s_d[~s_d.index.duplicated(keep="last")]
-        try:
-            s_d = s_d.resample("B").ffill()
-        except Exception:
-            # Last-resort: skip malformed indicator rather than kill the whole panel
-            continue
-        s_d = apply_transform(s_d, spec.transform, spec.transform_window)
-        if s_d.empty:
-            continue
-        pct = rolling_percentile(s_d)
-        score = pct.apply(lambda p, d=spec.direction: orient_score(p, d))
-        per_indicator[key] = score
-
-    if not per_indicator:
-        return pd.DataFrame()
-    return _carry_scores_to_edge(pd.DataFrame(per_indicator))
-
-
-def _carry_scores_to_edge(df: pd.DataFrame) -> pd.DataFrame:
-    """Carry each indicator's LAST valid score forward to the frame's end date.
-
-    Feeds publish on different lags (FRED's DGS10 a day behind yfinance, weekly
-    AAII/CTA/NFCI up to a week behind), so the final rows of the joint
-    frame are ragged. Without this, the historical pillar on those rows averages
-    only the indicators that happened to print that day — e.g. the Valuation
-    pillar swung from ~38 to ~0 when the daily NDX P/E printed a day after the
-    ERP — while the live gauge (score_indicators) uses each indicator's last
-    valid score. Carrying the last known reading forward is point-in-time
-    correct (it was the latest information on those days) and makes the chart
-    endpoint, pillar momentum and the gauge agree. Only the trailing edge is
-    filled; interior gaps (warm-up, zero-std stretches) are left untouched.
-    """
-    if df.empty:
-        return df
-    out = df.copy()
-    for col in out.columns:
-        last = out[col].last_valid_index()
-        if last is None or last == out.index[-1]:
-            continue
-        out.loc[out.index > last, col] = out.at[last, col]
+    out["net_themes"] = out["top_theme_count"] - out["bottom_theme_count"]
+    out["side"] = cluster_side(out)
     return out
 
 
-def _weighted_bucket_mean(per_ind: pd.DataFrame, cols: list[str]) -> pd.Series:
-    """Per-row weighted mean of indicator scores in `cols`, skipping NaNs.
-
-    Mirrors composite()'s within-bucket weighting so the historical pillar path
-    and the live composite use one consistent aggregation.
-    """
-    w = np.array([INDICATORS_BY_KEY[c].weight for c in cols], dtype=float)
-    sub = per_ind[cols]
-    mask = sub.notna()
-    num = (sub.fillna(0.0) * w).sum(axis=1)
-    den = (mask * w).sum(axis=1).replace(0, np.nan)
-    return num / den
-
-
+# ---------------------------------------------------------------------------
+# Historical pillars and composite
+# ---------------------------------------------------------------------------
 def historical_pillar_scores(raw: RawFrame, per_indicator: pd.DataFrame | None = None) -> pd.DataFrame:
     """
     Daily DataFrame with one column per pillar, values = pillar score 0-100 over
@@ -519,45 +682,95 @@ def historical_pillar_scores(raw: RawFrame, per_indicator: pd.DataFrame | None =
     per_indicator_history frame to avoid recomputing the rolling-percentile pass.
     """
     df = per_indicator_history(raw) if per_indicator is None else per_indicator
-    if df is None or df.empty:
-        return pd.DataFrame()
-
-    buckets: Dict[str, pd.Series] = {}
-    for bkey in BUCKET_WEIGHTS:
-        cols = [k for k, sp in INDICATORS_BY_KEY.items()
-                if sp.bucket == bkey and k in df.columns]
-        if cols:
-            buckets[bkey] = _weighted_bucket_mean(df, cols)
-    return pd.DataFrame(buckets)
+    return aggregate_scores(df)[0]
 
 
-def historical_composite(raw: RawFrame, pillars: pd.DataFrame | None = None) -> pd.Series:
-    """Rolling 0-100 composite regime score over time (weighted pillar average).
+def historical_composite(
+    raw: RawFrame,
+    pillars: pd.DataFrame | None = None,
+    per_indicator: pd.DataFrame | None = None,
+) -> pd.Series:
+    """Composite regime score over time, on dates with enough of the model live.
 
-    Accepts an optional precomputed `pillars` frame (from historical_pillar_scores)
-    so callers that also need pillar momentum don't pay for the rolling-percentile
-    pass twice.
+    Pass `per_indicator` to reuse the rolling-percentile pass. `pillars` is
+    accepted for older callers and ignored: coverage is counted indicator by
+    indicator, which pillar scores alone can't provide. Before the model is at
+    least MODEL_MIN_COVERAGE populated there is no value: the history used to
+    start in 1988 as a "composite" of one survey.
     """
-    if pillars is None:
-        pillars = historical_pillar_scores(raw)
-    if pillars.empty:
-        return pd.Series(dtype=float, name="composite")
-    w = pd.Series(BUCKET_WEIGHTS).reindex(pillars.columns).fillna(0.0)
-    if w.sum() == 0:
-        return pd.Series(dtype=float, name="composite")
-    valid = pillars.notna()
-    weighted = pillars.fillna(0.0).mul(w, axis=1).sum(axis=1)
-    denom = valid.mul(w, axis=1).sum(axis=1).replace(0, np.nan)
-    out = (weighted / denom).dropna()
-    out.name = "composite"
-    return out
+    df = per_indicator_history(raw) if per_indicator is None else per_indicator
+    return aggregate_scores(df)[1].dropna()
+
+
+def composite_context(comp_hist: pd.Series, window: int = ROLLING_WINDOW_DAYS) -> dict:
+    """Where today's composite sits in its own recent range.
+
+    An average of 30-odd percentile scores is compressed toward 50: over two
+    years of the full model it stayed between about 22 and 68, so the gauge's
+    outer bands are almost never reached. The rank against its own history says
+    how unusual a reading is.
+    """
+    if comp_hist is None or comp_hist.empty:
+        return {}
+    s = comp_hist.dropna().iloc[-window:]
+    if len(s) < 60:
+        return {}
+    cur = float(s.iloc[-1])
+    return {
+        "pct": float((s <= cur).mean() * 100.0),
+        "low": float(s.min()), "high": float(s.max()), "median": float(s.median()),
+        "years": len(s) / 252.0,
+        "d_1w": float(cur - s.iloc[-6]) if len(s) > 5 else float("nan"),
+    }
 
 
 # ---------------------------------------------------------------------------
 # Exposure recommendation — map composite score + cluster to an actionable position
 # ---------------------------------------------------------------------------
-CLUSTER_MIN_THEMES = 3   # distinct independent themes needed to fire an override
-CLUSTER_MIN_BUCKETS = 2  # spanning at least this many pillars (cross-confirmation)
+CLUSTER_MIN_THEMES = 3   # floor on the net themes a cluster needs (thin models)
+CLUSTER_MIN_BUCKETS = 2  # the winning side must span this many pillars
+
+# What a cluster does to the card, in points of net exposure.
+BOTTOM_CLUSTER_ADD = 15
+# A top cluster is a flag, not a cut. Over Nov 2022 - Nov 2026, the only window
+# with the full model, it was on about one session in seven and was followed by
+# ordinary returns, while a 20-point cut held the card near 42% net through a
+# rising market. Set these above zero to restore a cut once it has evidence.
+TOP_CLUSTER_CUT = 0
+TOP_CLUSTER_HEDGE = 0.0
+
+# Net exposure by composite score: the six regime bands' levels, placed at each
+# band's midpoint and joined by straight lines. The mapping used to be a step
+# function with a 40-point drop at 65 (90% at 64.9, 50% at 65.1), so a one-point
+# wobble in the score could move the recommendation by 40 points of exposure.
+EXPOSURE_KNOTS = ((7.5, 130.0), (25.0, 115.0), (40.0, 100.0), (55.0, 90.0), (75.0, 50.0), (92.5, 20.0))
+HEDGE_KNOTS = ((65.0, 0.0), (75.0, 0.5), (92.5, 1.0))
+# Label follows the exposure it describes: (floor of net %, label, colour).
+EXPOSURE_LABELS = (
+    (125, "BACK UP THE TRUCK", "#16a085"),
+    (105, "SCALE IN", "#27ae60"),
+    (95, "FULLY INVESTED", "#3498db"),
+    (80, "STANDARD ALLOCATION", "#95a5a6"),
+    (45, "TRIM", "#e67e22"),
+    (-1, "MAX DEFENSIVE", "#c0392b"),
+)
+
+
+def base_exposure(score: float) -> tuple[int, float]:
+    """(net %, hedge %) for a composite score, before any cluster override.
+    Net is rounded to 5 points and the hedge to a quarter point."""
+    xs, ys = zip(*EXPOSURE_KNOTS)
+    hx, hy = zip(*HEDGE_KNOTS)
+    net = int(round(float(np.interp(score, xs, ys)) / 5.0) * 5)
+    hedge = round(float(np.interp(score, hx, hy)) * 4.0) / 4.0
+    return net, hedge
+
+
+def exposure_label(net: float) -> tuple[str, str]:
+    for floor, label, color in EXPOSURE_LABELS:
+        if net >= floor:
+            return label, color
+    return EXPOSURE_LABELS[-1][1], EXPOSURE_LABELS[-1][2]
 
 
 def exposure_recommendation(
@@ -571,80 +784,60 @@ def exposure_recommendation(
 
     Returns dict with:
       - net_pct      : int, suggested net long % (can exceed 100 = levered long)
+      - base_pct     : int, the net % from the composite alone
       - hedge_pct    : float, suggested notional in OTM SPX puts as % of NAV
-      - label        : short action label ("TRIM", "BACK UP TRUCK", etc.)
+      - label        : short action label ("TRIM", "SCALE IN", etc.)
       - color        : hex color for UI (matches gauge regime colors)
       - conviction   : "High" / "Medium" / "Low"
       - rationale    : one-line explanation
       - cluster_override : bool — True if cluster forced a deviation from the base mapping
+      - cluster_side : "top" / "bottom" / None — which way the extremes are lopsided
+      - cluster_flag : bool — a top cluster is on but, with TOP_CLUSTER_CUT at 0,
+                       it is reported and changes nothing
 
-    Cluster overrides require a confluence of independent THEMES spanning multiple
-    pillars (not a raw indicator count), so one collinear vol event can't fake a
-    high-conviction signal. `covered_weight` (fraction of the model with data)
-    caps conviction: a partial-model reading can never be "High".
+    A cluster needs lopsided extremes (see cluster_side): a third of the model's
+    independent themes, net, at one extreme across 2+ pillars. A bottom cluster
+    adds exposure. A top cluster is a risk flag only until it has evidence.
+    `covered_weight` (fraction of the model with data) caps conviction: a
+    partial-model reading can never be "High".
     """
     if composite_score is None or (isinstance(composite_score, float) and np.isnan(composite_score)):
         return {
-            "net_pct": None, "hedge_pct": None,
+            "net_pct": None, "base_pct": None, "hedge_pct": None,
             "label": "NO DATA", "color": "#555",
             "conviction": "—", "rationale": "Composite unavailable.",
-            "cluster_override": False,
+            "cluster_override": False, "cluster_side": None, "cluster_flag": False,
         }
 
     s = float(composite_score)
-
-    # Base mapping from composite regime → exposure
-    if s < 15:
-        base = {"net": 130, "hedge": 0.0, "label": "BACK UP THE TRUCK",  "color": "#16a085"}
-    elif s < 35:
-        base = {"net": 115, "hedge": 0.0, "label": "SCALE IN",            "color": "#27ae60"}
-    elif s < 45:
-        base = {"net": 100, "hedge": 0.0, "label": "FULLY INVESTED",      "color": "#3498db"}
-    elif s < 65:
-        base = {"net": 90,  "hedge": 0.0, "label": "STANDARD ALLOCATION", "color": "#95a5a6"}
-    elif s < 85:
-        base = {"net": 50,  "hedge": 0.5, "label": "TRIM",                "color": "#e67e22"}
-    else:
-        base = {"net": 20,  "hedge": 1.0, "label": "MAX DEFENSIVE",       "color": "#c0392b"}
-
-    net = base["net"]
-    hedge = base["hedge"]
-    label = base["label"]
-    color = base["color"]
+    net, hedge = base_exposure(s)
+    base_net = net
+    label, color = exposure_label(net)
     cluster_override = False
     conviction = "Low"
 
-    # Theme-deduplicated counts + cross-pillar breadth drive the override.
     top_themes = int(cluster.get("top_theme_count", cluster.get("top_cluster_count", 0))) if cluster else 0
     bot_themes = int(cluster.get("bottom_theme_count", cluster.get("bottom_cluster_count", 0))) if cluster else 0
     top_buckets = len(cluster.get("top_buckets", [])) if cluster else 0
     bot_buckets = len(cluster.get("bottom_buckets", [])) if cluster else 0
+    side = cluster_side(cluster)
+    top_fire, bot_fire = side == "top", side == "bottom"
 
-    # Fire on a cross-pillar confluence (≥3 themes spanning ≥2 buckets) OR a
-    # strong single-pillar one (≥4 distinct themes) — the latter so a genuine
-    # credit-led blowout, whose themes all live in the credit_liquidity pillar,
-    # is not silently blocked by the cross-pillar requirement.
-    def _fires(themes: int, buckets: int) -> bool:
-        return themes >= CLUSTER_MIN_THEMES and (
-            buckets >= CLUSTER_MIN_BUCKETS or themes >= CLUSTER_MIN_THEMES + 1
-        )
-
-    top_fire = _fires(top_themes, top_buckets)
-    bot_fire = _fires(bot_themes, bot_buckets)
-
-    # Cluster overrides — the whole point of clusters is they trump noise
-    if top_fire:
-        net = max(0, net - 20)
-        hedge = max(hedge, 0.5) + 0.5  # at least 0.5%, plus 0.5 more on top
+    # A cluster is rare by construction, which is what earns it an override.
+    top_cuts = top_fire and (TOP_CLUSTER_CUT > 0 or TOP_CLUSTER_HEDGE > 0)
+    cluster_flag = top_fire and not top_cuts
+    if top_cuts:
+        net = max(0, net - TOP_CLUSTER_CUT)
+        hedge = max(hedge, 0.5) + TOP_CLUSTER_HEDGE
         cluster_override = True
-        label = f"TOP CLUSTER ({top_themes} themes) — CUT"
+        label = f"TOP CLUSTER ({top_themes} vs {bot_themes} themes) — CUT"
         color = "#c0392b"
         conviction = "High"
     elif bot_fire:
-        net = min(150, net + 15)
+        net = min(150, net + BOTTOM_CLUSTER_ADD)
         hedge = 0.0
         cluster_override = True
-        label = f"BOTTOM CLUSTER ({bot_themes} themes) — ADD"
+        label = f"BOTTOM CLUSTER ({bot_themes} vs {top_themes} themes) — ADD"
         color = "#16a085"
         conviction = "High"
     else:
@@ -666,9 +859,14 @@ def exposure_recommendation(
     if cluster_override:
         themes = top_themes if top_fire else bot_themes
         buckets = top_buckets if top_fire else bot_buckets
+        other = bot_themes if top_fire else top_themes
         rationale_bits.append(
-            f"{themes} independent themes across {buckets} pillars clustered at "
-            f"{'top' if top_fire else 'bottom'} — overrides base reading"
+            f"{themes} independent themes at a {'top' if top_fire else 'bottom'} extreme across {buckets} pillars, "
+            f"{other} at the other — overrides base reading"
+        )
+    if cluster_flag:
+        rationale_bits.append(
+            f"top-cluster flag ({top_themes} themes at a top extreme vs {bot_themes}): no exposure change, untested signal"
         )
     rationale_bits.append(f"composite {s:.0f}")
     if low_coverage:
@@ -677,14 +875,66 @@ def exposure_recommendation(
 
     return {
         "net_pct": int(round(net)),
+        "base_pct": int(base_net),
         "hedge_pct": float(hedge),
         "label": label,
         "color": color,
         "conviction": conviction,
         "rationale": rationale,
         "cluster_override": cluster_override,
+        "cluster_side": side,
+        "cluster_flag": bool(cluster_flag),
         "covered_weight": float(covered_weight),
     }
+
+
+def scores_from_row(row: pd.Series) -> pd.DataFrame:
+    """A minimal scores table for one date of per_indicator_history."""
+    return pd.DataFrame([
+        {"key": k, "label": sp.label, "bucket": sp.bucket, "weight": sp.weight, "theme": theme_for(k),
+         "score": float(row[k]) if k in row.index and pd.notna(row[k]) else np.nan}
+        for k, sp in _scored_specs().items()
+    ])
+
+
+def recommendation_at(per_ind: pd.DataFrame, sessions_back: int = 0) -> dict | None:
+    """The exposure card as it would have read `sessions_back` sessions ago,
+    rebuilt from that day's own scores: same composite, same cluster test."""
+    if per_ind is None or per_ind.empty or len(per_ind) <= sessions_back:
+        return None
+    pos = -1 - sessions_back
+    sc = scores_from_row(per_ind.iloc[pos])
+    comp = composite(sc)
+    rec = exposure_recommendation(comp["composite"], cluster_signal(sc), comp["covered_weight"])
+    rec["composite"] = comp["composite"]
+    rec["as_of"] = per_ind.index[pos]
+    return rec
+
+
+def contributions(scores_df: pd.DataFrame) -> pd.DataFrame:
+    """Each live indicator's pull on the composite, in points away from 50.
+
+    `share` is the indicator's actual weight in the composite (pillar weight x
+    its weight within the pillar, over what is live). The pulls add up to
+    composite - 50, so the list explains the number instead of approximating it.
+    """
+    cols = ["key", "label", "bucket", "score", "share", "contrib"]
+    comp = composite(scores_df)
+    if np.isnan(comp["composite"]):
+        return pd.DataFrame(columns=cols)
+    valid = {b: v for b, v in comp["buckets"].items() if not np.isnan(v["score"])}
+    total = sum(v["weight"] for v in valid.values())
+    live = scores_df.dropna(subset=["score"])
+    live = live[live["key"].isin(_scored_specs())]
+    rows = []
+    for b, info in valid.items():
+        sub = live[live["bucket"] == b]
+        wsum = float(sub["weight"].sum())
+        for r in sub.itertuples():
+            share = info["weight"] / total * float(r.weight) / wsum
+            rows.append({"key": r.key, "label": r.label, "bucket": b, "score": float(r.score),
+                         "share": share, "contrib": share * (float(r.score) - 50.0)})
+    return pd.DataFrame(rows, columns=cols).sort_values("contrib").reset_index(drop=True)
 
 
 def pillar_momentum(raw: RawFrame, pillars: pd.DataFrame | None = None) -> dict:
@@ -748,37 +998,42 @@ def read_confidence(
     scores_df: pd.DataFrame, covered_weight: float, now: datetime | None = None
 ) -> dict:
     """How much to trust today's composite: model coverage, indicator agreement
-    (score dispersion) and data freshness. A precise composite number is only as
-    good as how much of the model is online, how aligned it is, and how stale
-    its inputs are.
+    (score dispersion) and data freshness by the wall clock.
 
-    `staleness` = age in days of the STALEST contributing feed (max gap), or
-    None when no contributing indicator carries an `as_of` timestamp. Unknown
-    freshness is treated as NOT fresh (confidence capped at Low) — it used to
-    pass the High-tier check, rating an unverifiable reading as trustworthy.
+    Freshness is judged per indicator against its own publication cadence. A
+    single 10-day limit for everything meant the weekly CFTC and NFCI prints
+    ruled out "High" on most days for no reason. `staleness` is still the age of
+    the stalest contributing feed; `freshest` is the age of the newest, which is
+    what shows a whole pipeline that has stopped updating. Unknown freshness is
+    treated as NOT fresh (Low).
     """
     scored = scores_df.dropna(subset=["score"])
     n_contrib, total = int(len(scored)), int(len(scores_df))
     dispersion = float(scored["score"].std()) if len(scored) > 1 else np.nan
     now = datetime.now() if now is None else now
-    ages = [
-        (now - pd.Timestamp(a).to_pydatetime().replace(tzinfo=None)).days
-        for a in scored["as_of"].tolist()
-        if a is not None
-    ]
+    allow = scored["max_stale_days"].tolist() if "max_stale_days" in scored.columns else [10] * len(scored)
+    ages, n_overdue = [], 0
+    for a, limit in zip(scored["as_of"].tolist(), allow):
+        if a is None or (isinstance(a, float) and np.isnan(a)):
+            continue
+        age = (now - pd.Timestamp(a).to_pydatetime().replace(tzinfo=None)).days
+        ages.append(age)
+        n_overdue += int(age > limit)
     staleness = max(ages) if ages else None
+    freshest = min(ages) if ages else None
     n_missing_asof = n_contrib - len(ages)
+    n_stale = int((scores_df["status"] == "stale").sum()) if "status" in scores_df.columns else 0
 
     n_proxy = 0
     if "source_kind" in scored.columns:
         n_proxy = int(scored["source_kind"].isin(["proxy", "fallback"]).sum())
 
-    # Three-tier rating from the weakest dimension; unknown staleness = Low.
+    aligned = np.isnan(dispersion) or dispersion <= 25
     if staleness is None:
         level, color = "Low", "#c0392b"
-    elif covered_weight >= 0.8 and staleness <= 10 and (np.isnan(dispersion) or dispersion <= 25):
+    elif covered_weight >= 0.8 and n_overdue == 0 and freshest <= 4 and aligned:
         level, color = "High", "#16a085"
-    elif covered_weight >= 0.6 and staleness <= 21:
+    elif covered_weight >= 0.6 and freshest <= 7:
         level, color = "Medium", "#e67e22"
     else:
         level, color = "Low", "#c0392b"
@@ -786,6 +1041,7 @@ def read_confidence(
         "level": level, "color": color,
         "coverage_pct": covered_weight * 100.0,
         "n_contrib": n_contrib, "total": total,
-        "dispersion": dispersion, "staleness": staleness,
+        "dispersion": dispersion, "staleness": staleness, "freshest": freshest,
         "n_missing_asof": n_missing_asof, "n_proxy": n_proxy,
+        "n_overdue": n_overdue, "n_stale": n_stale,
     }

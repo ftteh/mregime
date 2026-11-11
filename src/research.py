@@ -1152,6 +1152,12 @@ def _passthrough_limit(ccc: pd.Series, ig: pd.Series, default: float = 0.135) ->
     return float((wide["i"] / wide["c"]).iloc[:-1].quantile(0.90))
 
 
+# SOFR−EFFR, 5-day average, below which funding is calm whatever its rank. Well
+# under any real squeeze (Sept 2019 was about +300bp); it only removes the case
+# where a spread near zero ranks high because the past year was even lower.
+FUNDING_FLOOR_BP = 5.0
+
+
 def system_guardrails(
     *,
     trend_breadth: pd.Series | None,
@@ -1202,13 +1208,19 @@ def system_guardrails(
                         f"IG/CCC pass-through below {limit:.2f}x", beta < limit, near=beta < limit * 1.5,
                         detail=f"CCC {ch_c:+.0f}bp vs IG {ch_i:+.0f}bp in 20 sessions ({beta:.2f}x)"))
     s = clean(sofr_spread)
+    label = f"SOFR−EFFR 5D avg below its 1Y 95th pct, or under +{FUNDING_FLOOR_BP:.0f}bp"
     if len(s) < 60:
-        out.append(_unavailable("funding", "Funding markets calm", "SOFR−EFFR below its 1Y 95th pct"))
+        out.append(_unavailable("funding", "Funding markets calm", label))
     else:
-        s = s.iloc[-252:]
-        p = pct_rank(s.rolling(5).mean().dropna())
-        out.append(Rule("funding", "Funding markets calm", float(s.iloc[-1]), "SOFR−EFFR below its 1Y 95th pct",
-                        p < 95, near=p < 99, detail=f"5D average at {ordinal(p)} pct of 1Y"))
+        avg = s.iloc[-252:].rolling(5).mean().dropna()
+        p, cur = pct_rank(avg), float(avg.iloc[-1])
+        # A rank alone fails 5% of the time by construction: in a year when SOFR
+        # sat below fed funds, a spread of zero is "the 95th percentile". Stress
+        # also has to be a positive spread of some size.
+        calm = cur < FUNDING_FLOOR_BP
+        out.append(Rule("funding", "Funding markets calm", float(s.iloc[-1]), label,
+                        p < 95 or calm, near=p < 99 or calm,
+                        detail=f"5D average {cur:+.1f}bp, {ordinal(p)} pct of 1Y"))
     s = clean(spx_corr)
     if len(s) < 40:
         out.append(_unavailable("corr", "No correlation shock", "S&P 60D avg correlation 20D rise < 0.15"))

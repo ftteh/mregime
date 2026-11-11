@@ -26,13 +26,13 @@ Gate inputs by start date: VIX COT from 2006 (usable after 2 years), S&P correla
 
 | Strategy | CAGR | Vol | Sharpe | Max DD | Worst 21D | Days levered |
 |---|---|---|---|---|---|---|
-| Never lever | 14.64% | 18.1% | 0.707 | -33.7% | -32.8% | 0.0% |
-| Uncapped | 14.41% | 19.1% | 0.670 | -35.8% | -34.9% | 1.2% |
-| Capped (live rule) | 14.64% | 18.1% | 0.707 | -33.7% | -32.8% | 0.0% |
-| Gate only | 14.54% | 18.2% | 0.700 | -34.4% | -33.4% | 0.5% |
-| Confirmation only | 14.64% | 18.1% | 0.707 | -33.7% | -32.8% | 0.0% |
+| Never lever | 14.86% | 18.1% | 0.717 | -33.7% | -32.8% | 0.0% |
+| Uncapped | 14.69% | 19.1% | 0.683 | -35.8% | -34.9% | 1.3% |
+| Capped (live rule) | 14.86% | 18.1% | 0.717 | -33.7% | -32.8% | 0.0% |
+| Gate only | 14.82% | 18.2% | 0.713 | -34.4% | -33.4% | 0.6% |
+| Confirmation only | 14.86% | 18.1% | 0.717 | -33.7% | -32.8% | 0.0% |
 
-- Capped (live rule) minus Uncapped: +0.02% a year, 90% CI -0.44 to +0.62
+- Capped (live rule) minus Uncapped: -0.03% a year, 90% CI -0.50 to +0.54
 - Capped (live rule) minus Never lever: +0.00% a year, 90% CI +0.00 to +0.00
 
 ### QQQ, 2003–2016 (out of sample)
@@ -69,12 +69,12 @@ Forward 21-day SPY return on washed days only.
 | 2003–2016 | Gate closes at 1 hit | +0.012 | +0.3pp | 0.1% |
 | 2003–2016 | Gate closes at 2 (live) | +0.012 | +0.3pp | 0.1% |
 | 2003–2016 | Gate closes at 3 | +0.013 | +0.4pp | 0.1% |
-| 2017–2026 | Confirm 2+ | +0.023 | +1.4pp | 0.2% |
-| 2017–2026 | Confirm 3+ (live) | +0.037 | +2.1pp | 0.0% |
-| 2017–2026 | Confirm 4+ | +0.037 | +2.1pp | 0.0% |
-| 2017–2026 | Gate closes at 1 hit | +0.037 | +2.1pp | 0.0% |
-| 2017–2026 | Gate closes at 2 (live) | +0.037 | +2.1pp | 0.0% |
-| 2017–2026 | Gate closes at 3 | +0.037 | +2.1pp | 0.0% |
+| 2017–2026 | Confirm 2+ | +0.024 | +1.4pp | 0.3% |
+| 2017–2026 | Confirm 3+ (live) | +0.035 | +2.1pp | 0.0% |
+| 2017–2026 | Confirm 4+ | +0.035 | +2.1pp | 0.0% |
+| 2017–2026 | Gate closes at 1 hit | +0.035 | +2.1pp | 0.0% |
+| 2017–2026 | Gate closes at 2 (live) | +0.035 | +2.1pp | 0.0% |
+| 2017–2026 | Gate closes at 3 | +0.035 | +2.1pp | 0.0% |
 
 ### Does a closed gate mark riskier conditions?
 
@@ -83,25 +83,35 @@ Forward 21-day SPY return on washed days only.
 | 2003–2016 | Open (0 hits) | 2649 | 13.4% | +0.82% | -2.18% |
 | 2017–2026 | Open (0 hits) | 1190 | 14.8% | +1.02% | -2.50% |
 | 2003–2016 | Partly closed (1) | 663 | 18.0% | +0.64% | -3.22% |
-| 2017–2026 | Partly closed (1) | 880 | 13.9% | +1.70% | -2.12% |
+| 2017–2026 | Partly closed (1) | 883 | 13.9% | +1.70% | -2.11% |
 | 2003–2016 | Closed (2+) | 213 | 35.2% | +1.43% | -5.69% |
-| 2017–2026 | Closed (2+) | 406 | 18.9% | +1.16% | -3.15% |
+| 2017–2026 | Closed (2+) | 405 | 18.9% | +1.14% | -3.15% |
 
 
 ## Test 2: the real composite model
 
-Only this window has the credit data the composite needs, so it overlaps the rule-building era. Treat it as a check that the logic runs on real scores, not as evidence.
+The window starts once 80% of the model's indicator weight has a year of history. The ICE credit spreads join later still, because FRED serves only three years of them. All of it overlaps the rule-building era, so treat it as a check that the logic runs on real scores, not as evidence.
 
-### SPY, Mar 2024–Nov 2026
+### SPY, Nov 2022–Nov 2026
 
 | Strategy | CAGR | Vol | Sharpe | Max DD | Worst 21D | Days levered |
 |---|---|---|---|---|---|---|
-| Card as it was | 15.24% | 15.1% | 0.734 | -17.6% | -11.9% | 7.4% |
-| Card with cap | 14.33% | 13.5% | 0.750 | -16.5% | -11.1% | 0.9% |
-| Flat 100% | 15.35% | 16.0% | 0.712 | -18.8% | -12.2% | 0.0% |
+| Card as it was | 18.76% | 15.2% | 0.913 | -18.9% | -12.3% | 10.1% |
+| Card with cap | 17.64% | 14.1% | 0.907 | -18.2% | -12.0% | 1.1% |
+| Flat 100% | 19.22% | 15.2% | 0.938 | -18.8% | -12.2% | 0.0% |
 
-- Sessions above 100%: 51 of 688; capped on 45. Bottom-cluster sessions: 51.
-- Cap minus no cap: -1.02% a year, 90% CI -2.36 to +0.24
+- Sessions above 100%: 105 of 1037; capped on 94. Bottom-cluster sessions: 33.
+- Cap minus no cap: -1.10% a year, 90% CI -2.16 to -0.27
+
+### How often the cluster override is on
+
+A cluster needs the themes at one extreme to lead the other side by a third of the live themes. Under the earlier rule (3 themes at one extreme, the other side ignored) a cluster was on almost every session, most of them TOP CLUSTER at about 20 points less exposure. A bottom cluster adds 15 points. A top cluster is a flag and changes nothing, because nothing here shows it is followed by weak returns. Forward SPY returns are descriptive only: overlapping days in a short window inside the rule-building era.
+
+| Cluster | Sessions | Share | Episodes | Avg net | Next 21D | Next 63D |
+|---|---|---|---|---|---|---|
+| TOP | 145 | 14.0% | 28 | 62% | +1.77% | +3.88% |
+| BOTTOM | 33 | 3.2% | 10 | 126% | +8.26% | +15.69% |
+| none | 859 | 82.8% | 39 | 88% | +1.33% | +4.83% |
 
 
 ## Test 3: the capitulation thresholds
@@ -113,10 +123,10 @@ Only this window has the credit data the composite needs, so it overlaps the rul
 | 2003–2016 | 2+ | 34 | -1.44pp | 0.94 | -0.51pp | 0.65 | 59% vs 71% | -5.7% |
 | 2003–2016 | 3+ | 11 | -3.23pp | 0.97 | -2.66pp | 0.84 | 64% vs 73% | -8.6% |
 | 2003–2016 | 4+ | 1 | -4.09pp | 0.84 | -0.91pp | 0.55 | 100% vs 77% | -2.7% |
-| 2017–2026 | 1+ | 131 | +0.21pp | 0.34 | -0.44pp | 0.69 | 71% vs 75% | -3.3% |
-| 2017–2026 | 2+ | 27 | +1.59pp | 0.07 | +3.30pp | 0.04 | 78% vs 74% | -3.6% |
-| 2017–2026 | 3+ | 6 | +2.41pp | 0.17 | +7.51pp | 0.03 | 83% vs 73% | -5.4% |
-| 2017–2026 | 4+ | 3 | +8.66pp | 0.01 | +19.89pp | 0.00 | 100% vs 74% | -1.0% |
+| 2017–2026 | 1+ | 131 | +0.22pp | 0.35 | -0.43pp | 0.69 | 71% vs 75% | -3.3% |
+| 2017–2026 | 2+ | 27 | +1.60pp | 0.07 | +3.31pp | 0.04 | 78% vs 74% | -3.6% |
+| 2017–2026 | 3+ | 6 | +2.42pp | 0.17 | +7.52pp | 0.03 | 83% vs 73% | -5.4% |
+| 2017–2026 | 4+ | 3 | +8.68pp | 0.01 | +19.90pp | 0.00 | 100% vs 74% | -1.0% |
 
 - T1 edge at 3+ rules out of sample: **FAIL**
 
@@ -126,66 +136,66 @@ Only this window has the credit data the composite needs, so it overlaps the rul
 
 | Threshold | OOS events | OOS edge | OOS p | In-sample events | In-sample edge | In-sample p |
 |---|---|---|---|---|---|---|
-| 24 | 5 | +3.76pp | 0.17 | 3 | +2.55pp | 0.33 |
-| 26 | 5 | +1.44pp | 0.40 | 4 | +4.74pp | 0.17 |
-| 28 | 10 | -1.84pp | 0.77 | 6 | +5.19pp | 0.10 |
-| 30 | 19 | +0.04pp | 0.49 | 14 | +7.08pp | 0.00 |
-| 32 ← | 34 | +2.58pp | 0.04 | 16 | +5.59pp | 0.01 |
-| 34 | 41 | +2.49pp | 0.03 | 29 | +4.29pp | 0.01 |
-| 36 | 51 | +1.88pp | 0.07 | 36 | +2.92pp | 0.04 |
-| 38 | 69 | +1.29pp | 0.12 | 41 | +2.38pp | 0.07 |
+| 24 | 5 | +3.76pp | 0.17 | 3 | +2.56pp | 0.32 |
+| 26 | 5 | +1.44pp | 0.40 | 4 | +4.75pp | 0.17 |
+| 28 | 10 | -1.84pp | 0.77 | 6 | +5.20pp | 0.11 |
+| 30 | 19 | +0.04pp | 0.49 | 14 | +7.09pp | 0.00 |
+| 32 ← | 34 | +2.58pp | 0.04 | 16 | +5.60pp | 0.01 |
+| 34 | 41 | +2.49pp | 0.03 | 29 | +4.30pp | 0.01 |
+| 36 | 51 | +1.88pp | 0.07 | 36 | +2.93pp | 0.04 |
+| 38 | 69 | +1.29pp | 0.12 | 41 | +2.39pp | 0.07 |
 
 **vxn**
 
 | Threshold | OOS events | OOS edge | OOS p | In-sample events | In-sample edge | In-sample p |
 |---|---|---|---|---|---|---|
-| 25 | 118 | +1.61pp | 0.03 | 100 | +2.02pp | 0.02 |
-| 27.5 | 90 | +2.85pp | 0.00 | 80 | +1.41pp | 0.10 |
-| 30 ← | 66 | +3.79pp | 0.00 | 57 | +2.75pp | 0.02 |
-| 32.5 | 54 | +4.08pp | 0.00 | 40 | +3.09pp | 0.02 |
-| 35 | 37 | +4.70pp | 0.00 | 30 | +5.48pp | 0.00 |
-| 40 | 27 | +4.91pp | 0.00 | 9 | +12.66pp | 0.00 |
+| 25 | 118 | +1.61pp | 0.03 | 100 | +2.03pp | 0.02 |
+| 27.5 | 90 | +2.85pp | 0.00 | 80 | +1.42pp | 0.10 |
+| 30 ← | 66 | +3.79pp | 0.00 | 57 | +2.76pp | 0.02 |
+| 32.5 | 54 | +4.08pp | 0.00 | 40 | +3.10pp | 0.02 |
+| 35 | 37 | +4.70pp | 0.00 | 30 | +5.49pp | 0.00 |
+| 40 | 27 | +4.91pp | 0.00 | 9 | +12.67pp | 0.00 |
 
 **sox_flush**
 
 | Threshold | OOS events | OOS edge | OOS p | In-sample events | In-sample edge | In-sample p |
 |---|---|---|---|---|---|---|
-| -10 | 13 | +4.12pp | 0.05 | 21 | +0.70pp | 0.37 |
-| -12.5 | 6 | +4.33pp | 0.10 | 8 | +9.76pp | 0.00 |
-| -15 ← | 2 | -5.13pp | 0.84 | 4 | +15.79pp | 0.00 |
-| -17.5 | 1 | +7.72pp | 0.09 | 1 | +26.66pp | 0.01 |
+| -10 | 13 | +4.12pp | 0.05 | 21 | +0.71pp | 0.38 |
+| -12.5 | 6 | +4.33pp | 0.10 | 8 | +9.77pp | 0.00 |
+| -15 ← | 2 | -5.13pp | 0.84 | 4 | +15.81pp | 0.00 |
+| -17.5 | 1 | +7.72pp | 0.09 | 1 | +26.67pp | 0.01 |
 | -20 | 1 | +7.72pp | 0.09 | 0 | +nanpp | nan |
 
 **vix_spike**
 
 | Threshold | OOS events | OOS edge | OOS p | In-sample events | In-sample edge | In-sample p |
 |---|---|---|---|---|---|---|
-| 20 | 42 | -1.19pp | 0.81 | 38 | +0.66pp | 0.33 |
-| 25 | 23 | -2.41pp | 0.87 | 26 | +1.33pp | 0.24 |
-| 30 ← | 16 | -0.74pp | 0.64 | 18 | +2.58pp | 0.12 |
-| 35 | 7 | +6.09pp | 0.04 | 16 | +2.62pp | 0.13 |
-| 40 | 5 | +8.39pp | 0.02 | 12 | +3.31pp | 0.12 |
-| 50 | 2 | +8.17pp | 0.09 | 6 | +1.33pp | 0.39 |
+| 20 | 42 | -1.19pp | 0.81 | 38 | +0.67pp | 0.33 |
+| 25 | 23 | -2.41pp | 0.87 | 26 | +1.34pp | 0.23 |
+| 30 ← | 16 | -0.74pp | 0.64 | 18 | +2.59pp | 0.12 |
+| 35 | 7 | +6.09pp | 0.04 | 16 | +2.63pp | 0.13 |
+| 40 | 5 | +8.39pp | 0.02 | 12 | +3.32pp | 0.12 |
+| 50 | 2 | +8.17pp | 0.09 | 6 | +1.34pp | 0.38 |
 
 **skew**
 
 | Threshold | OOS events | OOS edge | OOS p | In-sample events | In-sample edge | In-sample p |
 |---|---|---|---|---|---|---|
-| 0.9 | 151 | -0.22pp | 0.64 | 117 | -1.86pp | 0.98 |
-| 0.95 | 108 | -0.86pp | 0.84 | 87 | -2.32pp | 0.99 |
-| 0.97 | 83 | -1.39pp | 0.91 | 65 | -2.46pp | 0.98 |
-| 0.985 ← | 59 | -1.70pp | 0.92 | 49 | -2.68pp | 0.98 |
-| 0.995 | 36 | -0.96pp | 0.73 | 26 | -1.93pp | 0.85 |
+| 0.9 | 151 | -0.22pp | 0.64 | 117 | -1.85pp | 0.97 |
+| 0.95 | 108 | -0.86pp | 0.84 | 87 | -2.31pp | 0.99 |
+| 0.97 | 83 | -1.39pp | 0.91 | 65 | -2.45pp | 0.98 |
+| 0.985 ← | 59 | -1.70pp | 0.92 | 49 | -2.67pp | 0.98 |
+| 0.995 | 36 | -0.96pp | 0.73 | 26 | -1.92pp | 0.86 |
 
 ### Threshold verdict
 
 | Rule | Threshold | T2 plateau | T3 stable | OOS edge | In-sample edge |
 |---|---|---|---|---|---|
-| qqq_rsi | 32.0 | FAIL | PASS | +2.58pp | +5.59pp |
-| vxn | 30.0 | PASS | PASS | +3.79pp | +2.75pp |
-| sox_flush | -15.0 | FAIL | FAIL | -5.13pp | +15.79pp |
-| vix_spike | 30.0 | FAIL | FAIL | -0.74pp | +2.58pp |
-| skew | 0.985 | PASS | PASS | -1.70pp | -2.68pp |
+| qqq_rsi | 32.0 | FAIL | PASS | +2.58pp | +5.60pp |
+| vxn | 30.0 | PASS | PASS | +3.79pp | +2.76pp |
+| sox_flush | -15.0 | FAIL | FAIL | -5.13pp | +15.81pp |
+| vix_spike | 30.0 | FAIL | FAIL | -0.74pp | +2.59pp |
+| skew | 0.985 | PASS | PASS | -1.70pp | -2.67pp |
 
 Share of days with VXN at 30 or above: 2002 100%, 2003 69%, 2008 42%, 2009 45%, 2017 0%, 2019 1%, 2023 0%, 2025 6%
 
@@ -193,14 +203,14 @@ Share of days with VXN at 30 or above: 2002 100%, 2003 69%, 2008 42%, 2009 45%, 
 
 | Rule | Pct | Events | 21D edge | 63D edge | p |
 |---|---|---|---|---|---|
-| momentum | 1 | 20 | +1.39pp | +5.01pp | 0.01 |
-| momentum | 2 ← | 39 | +1.07pp | +2.54pp | 0.05 |
-| momentum | 5 | 67 | +0.34pp | +1.09pp | 0.17 |
-| momentum | 10 | 96 | +0.59pp | +0.49pp | 0.30 |
-| hf_unwind | 1 | 16 | +1.33pp | +4.05pp | 0.06 |
-| hf_unwind | 2 ← | 32 | +0.76pp | +2.69pp | 0.07 |
-| hf_unwind | 5 | 64 | +0.20pp | +0.34pp | 0.39 |
-| hf_unwind | 10 | 81 | -0.35pp | -0.35pp | 0.63 |
+| momentum | 1 | 20 | +1.40pp | +5.03pp | 0.01 |
+| momentum | 2 ← | 39 | +1.08pp | +2.55pp | 0.05 |
+| momentum | 5 | 67 | +0.35pp | +1.11pp | 0.18 |
+| momentum | 10 | 96 | +0.60pp | +0.50pp | 0.31 |
+| hf_unwind | 1 | 16 | +1.34pp | +4.06pp | 0.05 |
+| hf_unwind | 2 ← | 32 | +0.77pp | +2.70pp | 0.07 |
+| hf_unwind | 5 | 64 | +0.04pp | +0.35pp | 0.38 |
+| hf_unwind | 10 | 81 | -0.47pp | -0.34pp | 0.62 |
 
 
 ## Test 4: the guardrails
@@ -212,8 +222,8 @@ Long-history stand-ins: Baa–10Y spread for credit, and a stock panel of curren
 | 2003–2016 | INTACT | 1890 | +2.71% | 73% | -2.95% |
 | 2003–2016 | WATCH | 1174 | +3.25% | 73% | -4.46% |
 | 2003–2016 | BREAKING | 461 | +0.38% | 59% | -7.75% |
-| 2017–2026 | INTACT | 1519 | +2.89% | 76% | -3.76% |
-| 2017–2026 | WATCH | 751 | +4.60% | 79% | -3.58% |
+| 2017–2026 | INTACT | 1521 | +2.88% | 76% | -3.75% |
+| 2017–2026 | WATCH | 751 | +4.60% | 79% | -3.59% |
 | 2017–2026 | BREAKING | 206 | +7.82% | 82% | -5.13% |
 
 ### Does a broken system spoil a washout?
@@ -222,7 +232,7 @@ Long-history stand-ins: Baa–10Y spread for credit, and a stock panel of curren
 |---|---|---|---|---|---|
 | 2003–2016 | Washed + not breaking | 14 | 5 | +4.01% | -3.53% |
 | 2003–2016 | Washed + breaking | 42 | 9 | -2.12% | -10.31% |
-| 2017–2026 | Washed + not breaking | 5 | 3 | +0.86% | -2.28% |
+| 2017–2026 | Washed + not breaking | 7 | 3 | +0.86% | -1.19% |
 | 2017–2026 | Washed + breaking | 25 | 5 | +15.96% | -6.99% |
 
 
@@ -232,7 +242,7 @@ If laggards are stretched against tech, does the trade mean-revert? Target is th
 
 | Period | Events | 21D vs base | p | 63D vs base | p  |
 |---|---|---|---|---|---|
-| 2017–2026 | 3 | +1.40pp | 0.33 | -1.97pp | 0.65 |
+| 2017–2026 | 3 | +1.36pp | 0.34 | -2.00pp | 0.65 |
 
 
 ## Post-hoc checks
@@ -272,9 +282,9 @@ Not a clean test: SKEW was removed after seeing 2003–2016, so that window now 
 |---|---|---|---|---|---|---|---|---|
 | 2003–2016 | 2+ of 4 | 25 | -0.11pp | 0.55 | +0.81pp | 0.35 | 72% vs 73% | -5.5% |
 | 2003–2016 | 3+ of 4 | 7 | -4.27pp | 0.99 | -4.50pp | 0.95 | 71% vs 77% | -9.0% |
-| 2017–2026 | 2+ of 4 | 20 | +1.83pp | 0.09 | +4.04pp | 0.02 | 75% vs 73% | -3.9% |
-| 2017–2026 | 3+ of 4 | 4 | +2.77pp | 0.16 | +14.11pp | 0.01 | 100% vs 74% | -7.5% |
-| 2017–2026 | 4+ of 4 | 3 | +8.66pp | 0.01 | +19.89pp | 0.00 | 100% vs 74% | -1.0% |
+| 2017–2026 | 2+ of 4 | 20 | +1.84pp | 0.09 | +4.05pp | 0.02 | 75% vs 73% | -3.9% |
+| 2017–2026 | 3+ of 4 | 4 | +2.78pp | 0.15 | +14.13pp | 0.01 | 100% vs 74% | -7.5% |
+| 2017–2026 | 4+ of 4 | 3 | +8.68pp | 0.01 | +19.90pp | 0.00 | 100% vs 74% | -1.0% |
 
 ### Cap with a signal that lasts 21 sessions, like the card's cluster
 
@@ -295,14 +305,14 @@ Not a clean test: SKEW was removed after seeing 2003–2016, so that window now 
 
 | Strategy | CAGR | Vol | Sharpe | Max DD | Worst 21D | Days levered |
 |---|---|---|---|---|---|---|
-| Never lever | 14.64% | 18.1% | 0.707 | -33.7% | -32.8% | 0.0% |
-| Uncapped | 14.91% | 20.1% | 0.668 | -39.8% | -38.9% | 5.5% |
-| Capped (live rule) | 14.95% | 18.3% | 0.717 | -33.7% | -32.8% | 1.7% |
-| Gate only | 14.98% | 18.5% | 0.712 | -34.4% | -33.4% | 4.1% |
-| Confirmation only | 14.81% | 18.3% | 0.709 | -33.7% | -32.8% | 1.8% |
+| Never lever | 14.86% | 18.1% | 0.717 | -33.7% | -32.8% | 0.0% |
+| Uncapped | 15.19% | 20.1% | 0.680 | -39.8% | -38.9% | 5.5% |
+| Capped (live rule) | 15.17% | 18.3% | 0.727 | -33.7% | -32.8% | 1.7% |
+| Gate only | 15.26% | 18.5% | 0.725 | -34.4% | -33.4% | 4.2% |
+| Confirmation only | 15.03% | 18.4% | 0.719 | -33.7% | -32.8% | 1.8% |
 
-- Capped (live rule) minus Uncapped: -0.31% a year, 90% CI -1.32 to +0.71
-- Capped (live rule) minus Never lever: +0.30% a year, 90% CI -0.14 to +0.83
+- Capped (live rule) minus Uncapped: -0.37% a year, 90% CI -1.40 to +0.65
+- Capped (live rule) minus Never lever: +0.30% a year, 90% CI -0.12 to +0.83
 
 **Does it block the right days?**
 

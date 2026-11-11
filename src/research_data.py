@@ -23,6 +23,7 @@ import yfinance as yf
 
 from src import data as D
 from src import research as R
+from src import session as SES
 
 log = logging.getLogger(__name__)
 
@@ -97,9 +98,11 @@ def _cellwise_chain(*, key: str, live: pd.DataFrame, cache_file: str, seed_file:
     is right for one-source series but would blank a ticker's history whenever
     Yahoo drops just that ticker from a bulk download.
     """
-    cache = D._load_frame_cache(cache_file)
+    # Closed sessions only, on every leg (see data._with_fallback_chain).
+    cache = D._closed_only(D._load_frame_cache(cache_file))
     seed = D._load_seed_frame(seed_file)
     older = cache.combine_first(seed) if not cache.empty else seed
+    live = D._closed_only(live) if live is not None else live
     if live is not None and not live.empty:
         merged = live.combine_first(older) if not older.empty else live
         merged = merged.sort_index()
@@ -136,7 +139,9 @@ def fetch_prices_live(tickers: list[str] | None = None, start: str = "1990-01-01
         close.index = close.index.tz_localize(None)
     close.index.name = "date"
     close.columns.name = None
-    return close
+    # Closed sessions only, at the fetch: this frame also feeds the committed
+    # seed (scripts/refresh_seeds.py), which must never hold a half-day bar.
+    return D._closed_only(close)
 
 
 def on_us_calendar(prices: pd.DataFrame) -> pd.DataFrame:
@@ -214,7 +219,12 @@ def fetch_cot_live() -> pd.DataFrame:
         return pd.DataFrame()
 
 
+@D._memoized_fetch
 def cot_positioning() -> pd.DataFrame:
+    """Net position as % of open interest for every market in COT_MARKETS.
+
+    Memoized per build: the scored CTA indicator and the research desk read the
+    same frame, so they cannot disagree."""
     return _cellwise_chain(key="cot_positioning", live=fetch_cot_live(), cache_file="cot_positioning_history.csv",
                            seed_file="cot_positioning_seed.csv", source="cftc:publicreporting (TFF + Disaggregated)")
 
@@ -274,7 +284,7 @@ def cboe_volumes(max_backfill: int = 25) -> pd.DataFrame:
     cache = D._load_frame_cache("cboe_volume_history.csv")
     seed = D._load_seed_frame("cboe_volume_seed.csv")
     known = cache.combine_first(seed) if not cache.empty else seed
-    end = pd.Timestamp.today().normalize()
+    end = SES.closed_cutoff()
     start = end - pd.tseries.offsets.BDay(max_backfill)
     if not known.empty:
         start = max(start, known.index.max() + pd.Timedelta(days=1))

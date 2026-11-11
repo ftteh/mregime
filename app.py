@@ -9,6 +9,7 @@ Run:
 """
 from __future__ import annotations
 
+import html
 import os
 from datetime import date, datetime
 
@@ -50,11 +51,15 @@ from src import analytics as AN
 from src import charts as CH
 from src import desk as DK
 from src import desk_ui as DKUI
+from src import research as R
 from src import research_data as RD
+from src import session as SES
 from src.indicators import (
     build_raw,
     cluster_signal,
     composite,
+    composite_context,
+    contributions,
     exposure_recommendation,
     gauge_state,
     historical_composite,
@@ -64,6 +69,7 @@ from src.indicators import (
     orient_score,
     pillar_momentum,
     read_confidence,
+    recommendation_at,
     score_indicators,
 )
 
@@ -127,8 +133,8 @@ def load_all():
     cluster = cluster_signal(scores)
     pillars = historical_pillar_scores(raw, per_indicator=per_ind)
     momentum = pillar_momentum(raw, pillars=pillars)
-    comp_hist = historical_composite(raw, pillars=pillars)
-    return raw, scores, comp, cluster, momentum, comp_hist, pillars
+    comp_hist = historical_composite(raw, per_indicator=per_ind)
+    return raw, scores, comp, cluster, momentum, comp_hist, pillars, per_ind
 
 
 @st.cache_data(ttl=60 * 60, show_spinner="Building the research desk…")
@@ -172,18 +178,33 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("### How to read")
     st.markdown(
-        "- **>85**: Extreme complacency → de-risk, tail hedges  \n"
+        "- **≥85**: Extreme complacency → de-risk, tail hedges  \n"
         "- **65–85**: Complacent → trim, tighten stops  \n"
         "- **45–65**: Neutral  \n"
-        "- **15–35**: Fearful → watch for stabilization  \n"
-        "- **<15**: Panic / capitulation → accumulate"
+        "- **35–45**: Fearful → watch for stabilization  \n"
+        "- **15–35**: Panic → accumulate quality  \n"
+        "- **<15**: Capitulation → aggressive accumulation"
+    )
+    st.caption(
+        "The score averages 30-odd percentile readings, so it rarely leaves 25–70. "
+        "The line under the gauge shows where today sits in its own range. "
+        "Scores use closing data only; a session in progress is shown as live quotes, not scored."
     )
 
 
 # ---------------------------------------------------------------------------
 # Load
 # ---------------------------------------------------------------------------
-raw, scores, comp, cluster, momentum, comp_hist, pillars = load_all()
+raw, scores, comp, cluster, momentum, comp_hist, pillars, per_ind = load_all()
+
+# Closing basis: which session the scores run through, and whether one is printing now.
+SCORES_AS_OF = per_ind.index[-1] if per_ind is not None and not per_ind.empty else None
+SESSION = {
+    "as_of": SCORES_AS_OF,
+    "quotes": raw.live,
+    "live": bool(raw.live) and not SES.include_live() and SCORES_AS_OF is not None,
+    "provisional": SES.include_live() and SES.in_trading_hours(),
+}
 
 # All time-series charts share this x-axis window (aligned duration)
 CHART_LOOKBACK_YEARS = 3
@@ -338,9 +359,9 @@ def _line(
                 y=overlay_s.values,
                 mode="lines",
                 line=dict(width=1.4, color="rgba(154,164,173,0.55)", dash="dot"),
-                name="synthetic/legacy backfill (display only)",
+                name="not scored (other methodology / legacy)",
                 showlegend=True,
-                hovertemplate="backfill (not scored) %{x|%Y-%m-%d}: %{y:.4g}<extra></extra>",
+                hovertemplate="not scored %{x|%Y-%m-%d}: %{y:.4g}<extra></extra>",
             )
         )
     if not plot_s.empty:
@@ -500,17 +521,21 @@ except Exception as _desk_err:  # noqa: BLE001
 _leverage = DK.leverage_permission(_desk)
 exp_rec = DK.apply_leverage_cap(exp_rec, _leverage)
 
-# Trend: what was our suggested exposure ~5 business days ago?
+# Trend: what did the card say 5 sessions ago? Rebuilt from that day's own
+# scores, cluster test included. It used to drop the cluster for last week only,
+# so a cluster that was on both weeks showed up as a change.
 prev_exp = None
 prev_score = np.nan
 try:
-    if comp_hist is not None and not comp_hist.empty and len(comp_hist) >= 6:
-        prev_score = float(comp_hist.iloc[-6])  # ~1 week back (5 business days)
-        if not np.isnan(prev_score):
-            # Same cap as today, so the week-on-week change compares like with like.
-            prev_exp = DK.apply_leverage_cap(exposure_recommendation(prev_score, cluster=None), _leverage)
+    _prev = recommendation_at(per_ind, sessions_back=5)
+    if _prev is not None and _prev.get("net_pct") is not None:
+        prev_score = float(_prev["composite"])
+        # Same cap as today, so the week-on-week change compares like with like.
+        prev_exp = DK.apply_leverage_cap(_prev, _leverage)
 except Exception:
     prev_exp = None
+
+COMP_CONTEXT = composite_context(comp_hist)
 
 
 # Trust calc lives in src.indicators.read_confidence (pure logic, unit-tested):
@@ -522,6 +547,33 @@ CONFIDENCE = read_confidence(scores, COVERED_WEIGHT)
 # HEADER — the "daily glance"
 # ---------------------------------------------------------------------------
 st.markdown(f"## Market Regime — {datetime.now().strftime('%A, %b %d %Y')}")
+
+
+def _live_quote_text() -> str:
+    bits = []
+    for tkr, name, fmt in (("^GSPC", "S&P 500", "{:,.0f}"), ("^VIX", "VIX", "{:.1f}")):
+        q = raw.live.get(tkr)
+        if not q:
+            continue
+        chg = ""
+        if q.get("prev_close") and not np.isnan(q["prev_close"]):
+            chg = (f" ({(q['value'] / q['prev_close'] - 1) * 100:+.1f}% vs close)" if tkr == "^GSPC"
+                   else f" ({q['value'] - q['prev_close']:+.1f} vs close)")
+        bits.append(f"{name} {fmt.format(q['value'])}{chg}")
+    return " · ".join(bits)
+
+
+if SCORES_AS_OF is not None:
+    _asof_txt = f"Scores use closing data through **{SCORES_AS_OF:%a %d %b %Y}**."
+    if SESSION["live"]:
+        _q = _live_quote_text()
+        st.info(_asof_txt + " A US session is in progress and is not scored"
+                + (f". Live when this page was built: {_q}." if _q else "."))
+    elif SESSION["provisional"]:
+        st.warning("Live-session mode is on (QUANT_INCLUDE_LIVE): today's unfinished bar is being scored as if it "
+                   "were a close. Every reading below is provisional.")
+    else:
+        st.caption(_asof_txt)
 
 hc1, hc_exp, hc2, hc3, hc4 = st.columns([1.25, 1.4, 0.95, 0.95, 1.0])
 
@@ -633,20 +685,29 @@ with hc1:
         f"<b>{label}</b></div>",
         unsafe_allow_html=True,
     )
+    if COMP_CONTEXT and GAUGE["status"] == "ok":
+        _wk = COMP_CONTEXT["d_1w"]
+        _wk_txt = "" if np.isnan(_wk) else f" · {_wk:+.1f} in 1w"
+        st.markdown(
+            f"<div class='sub' style='text-align:center; margin-top:4px;'>{R.ordinal(COMP_CONTEXT['pct'])} percentile of its own "
+            f"last {COMP_CONTEXT['years']:.1f}y (range {COMP_CONTEXT['low']:.0f}–{COMP_CONTEXT['high']:.0f}){_wk_txt}</div>",
+            unsafe_allow_html=True,
+        )
 
     # Confidence chip — how much to trust the precise number above.
     _cf = CONFIDENCE
     _disp = "—" if _cf["dispersion"] is None or np.isnan(_cf["dispersion"]) else f"{_cf['dispersion']:.0f}"
-    _stale = "unknown" if _cf["staleness"] is None else f"{_cf['staleness']}d"
+    _fresh = "unknown" if _cf["freshest"] is None else f"{_cf['freshest']}d"
     _agree_txt = "aligned" if (_cf["dispersion"] is not None and not np.isnan(_cf["dispersion"]) and _cf["dispersion"] <= 25) else "mixed"
     _proxy_txt = f" · {_cf['n_proxy']} proxy/fallback feeds" if _cf.get("n_proxy") else ""
+    _stale_txt = f" · {_cf['n_stale']} stale, not voting" if _cf.get("n_stale") else ""
     st.markdown(
         f"""
 <div style='text-align:center; margin-top:8px;'>
   <span class='pill' style='background:{_cf['color']}'>CONFIDENCE: {_cf['level']}</span>
   <div class='sub' style='margin-top:4px;'>
     {_cf['n_contrib']}/{_cf['total']} indicators · {_cf['coverage_pct']:.0f}% of model weight ·
-    spread {_disp} ({_agree_txt}) · stalest feed {_stale}{_proxy_txt}
+    spread {_disp} ({_agree_txt}) · newest data {_fresh} old{_stale_txt}{_proxy_txt}
   </div>
 </div>
 """,
@@ -714,7 +775,11 @@ with hc_exp:
             "<div style='display:inline-block; background:#c0392b; color:#fff; "
             "font-size:0.7rem; font-weight:700; padding:3px 8px; border-radius:4px; "
             "margin-bottom:8px; letter-spacing:0.5px;'>⚠ CLUSTER OVERRIDE</div>"
-            if override else ""
+            if override else
+            "<div style='display:inline-block; background:#b9770e; color:#fff; "
+            "font-size:0.7rem; font-weight:700; padding:3px 8px; border-radius:4px; "
+            "margin-bottom:8px; letter-spacing:0.5px;'>⚑ TOP-CLUSTER FLAG · NO CUT</div>"
+            if exp_rec.get("cluster_flag") else ""
         )
 
         # Pull rgb for soft glow
@@ -743,6 +808,7 @@ with hc_exp:
   </div>
   {cap_html}
   <div style='font-size: 0.8rem; color: #ccc; line-height: 1.6; text-align: left; padding: 0 4px;'>
+    <div>Composite alone: <b>{exp_rec.get('base_pct', net_pct)}%</b>{' · cluster adjusts it' if override else ''}</div>
     <div>Hedge: <b style='color:{hedge_color};'>{hedge_txt}</b></div>
     <div>Conviction: <b>{conviction}</b></div>
     <div style='margin-top: 6px; color: #888; font-size: 0.74rem; line-height: 1.4;'>{trend_html}</div>
@@ -803,18 +869,19 @@ with hc4:
     bcnt = cluster["bottom_cluster_count"]
     t_themes = cluster.get("top_theme_count", tcnt)
     b_themes = cluster.get("bottom_theme_count", bcnt)
-    t_buckets = len(cluster.get("top_buckets", []))
-    b_buckets = len(cluster.get("bottom_buckets", []))
-    if exp_rec.get("cluster_override") and "TOP" in exp_rec.get("label", ""):
-        st.error(f"TOP CLUSTER · {t_themes} themes / {t_buckets} pillars")
-    elif exp_rec.get("cluster_override") and "BOTTOM" in exp_rec.get("label", ""):
-        st.success(f"BOTTOM CLUSTER · {b_themes} themes / {b_buckets} pillars")
+    _need, _live_themes = cluster.get("need", 8), cluster.get("themes_live", 0)
+    if cluster.get("side") == "top":
+        st.warning(f"TOP-CLUSTER FLAG · {t_themes} themes vs {b_themes}"
+                   + ("" if exp_rec.get("cluster_override") else " · no exposure change"))
+    elif cluster.get("side") == "bottom":
+        st.success(f"BOTTOM CLUSTER · {b_themes} themes vs {t_themes}")
     else:
-        st.info(f"No actionable cluster · {t_themes}↑ / {b_themes}↓ themes")
+        st.info(f"No cluster · {t_themes}↑ / {b_themes}↓ themes")
     st.caption(
-        f"At extreme: **{tcnt}** top-risk, **{bcnt}** panic indicators "
-        f"(**{t_themes}**/**{b_themes}** independent themes). "
-        "Override needs ≥3 themes across ≥2 pillars — collinear vol counts once."
+        f"At an extreme vs their own 3 years: **{t_themes}** themes top-risk, **{b_themes}** panic, "
+        f"of {_live_themes} live. A cluster needs one side ahead by **{_need}** across 2+ pillars: "
+        "a few themes sit at each extreme on any ordinary day, so only a lopsided count means something. "
+        "A bottom cluster adds exposure; a top cluster is a risk flag only."
     )
 
 
@@ -822,44 +889,67 @@ with hc4:
 # TODAY'S READ — one-line synthesis so the decision doesn't require eyeballing
 # 20 charts: verdict, what's pulling the score, the fastest mover, divergences.
 # ---------------------------------------------------------------------------
+def _bullets(items: list[str], color: str = "#c9d1d9") -> str:
+    if not items:
+        return "<div class='sub'>None.</div>"
+    return "".join(
+        f"<div style='font-size:0.84rem; color:{color}; line-height:1.45; margin-bottom:6px;'>{html.escape(i)}</div>"
+        for i in items
+    )
+
+
 def _todays_read() -> None:
-    scored = scores.dropna(subset=["score"]).copy()
-    if scored.empty:
-        return
-    # Top contributors: distance from neutral (50) weighted by indicator weight.
-    scored["pull"] = (scored["score"] - 50.0) * scored["weight"].fillna(1.0)
-    top_risk = scored.sort_values("pull", ascending=False).head(3)
-    top_safe = scored.sort_values("pull", ascending=True).head(3)
+    d = DK.decision(exp_rec, comp, cluster, CONFIDENCE, _desk, context=COMP_CONTEXT, session=SESSION)
+
+    # What is actually moving the number: each indicator's pull in composite
+    # points (pillar weight x weight within the pillar), which sums to score - 50.
+    pulls = contributions(scores)
 
     def _names(df_):
-        return ", ".join(f"{r.label} ({r.score:.0f})" for r in df_.itertuples()) or "—"
+        return ", ".join(f"{r.label} ({r.contrib:+.1f})" for r in df_.itertuples()) or "—"
+
+    up_txt = _names(pulls[pulls["contrib"] > 0].sort_values("contrib", ascending=False).head(3)) if not pulls.empty else "—"
+    dn_txt = _names(pulls[pulls["contrib"] < 0].head(3)) if not pulls.empty else "—"
 
     # Fastest-moving pillar this week (from momentum deltas).
     mover_txt = "—"
     if isinstance(momentum, dict) and momentum:
         best = None
         for bkey, m in momentum.items():
-            d = m.get("d_1w", np.nan)
-            if d is not None and not np.isnan(d) and (best is None or abs(d) > abs(best[1])):
-                best = (bkey, d)
+            dlt = m.get("d_1w", np.nan)
+            if dlt is not None and not np.isnan(dlt) and (best is None or abs(dlt) > abs(best[1])):
+                best = (bkey, dlt)
         if best is not None:
             nm = pillar_names.get(best[0], best[0])
             arrow = "▲ toward top-risk" if best[1] > 0 else "▼ toward bottom"
             mover_txt = f"{nm} {arrow} ({best[1]:+.1f} in 1w)"
 
-    net_txt = "—" if exp_rec["net_pct"] is None else f"{exp_rec['net_pct']}% net equity"
-    verdict_color = exp_rec["color"]
+    conflict_html = ""
+    if d["conflicts"]:
+        conflict_html = (
+            "<div style='margin-top:10px; padding:8px 12px; border-left:3px solid #e0a84a; background:rgba(224,168,74,0.08);'>"
+            "<div style='color:#e0a84a; font-size:0.72rem; letter-spacing:1px; font-weight:700; margin-bottom:4px;'>"
+            "THE TWO READS DISAGREE</div>" + _bullets(d["conflicts"], "#e6d3a8") + "</div>"
+        )
+    head = "color:#9aa4ad; font-size:0.72rem; letter-spacing:1px; font-weight:700; margin-bottom:6px;"
     st.markdown(
         f"""
-<div class='card' style='border-left:4px solid {verdict_color};'>
-  <div style='font-size:1.05rem; font-weight:700; color:#fff; margin-bottom:6px;'>
-    Today's read — {exp_rec['label']} · {net_txt}
+<div class='card' style='border-left:4px solid {d['tone']};'>
+  <div style='font-size:1.15rem; font-weight:800; color:#fff;'>
+    Today's read — {html.escape(d['headline'])}
     <span class='pill' style='background:{CONFIDENCE['color']}; margin-left:8px;'>{CONFIDENCE['level']} confidence</span>
   </div>
-  <div class='sub' style='line-height:1.7;'>
-    <b style='color:#ff8c8c;'>Pulling toward top-risk:</b> {_names(top_risk)}<br>
-    <b style='color:#7fd99a;'>Pulling toward bottom:</b> {_names(top_safe)}<br>
-    <b>Fastest mover:</b> {mover_txt} &nbsp;·&nbsp; <b>Rationale:</b> {exp_rec['rationale']}
+  <div class='sub' style='font-size:0.9rem; margin:2px 0 10px 0;'>{html.escape(d['sub'])}</div>
+  <div style='display:flex; flex-wrap:wrap; gap:22px;'>
+    <div style='flex:1 1 300px;'><div style='{head}'>WHY</div>{_bullets(d['why'])}</div>
+    <div style='flex:1 1 300px;'><div style='{head}'>WHAT WOULD CHANGE IT</div>{_bullets(d['triggers'])}</div>
+    <div style='flex:1 1 260px;'><div style='{head}'>DISCOUNT FOR</div>{_bullets(d['caveats'], '#b9c0c7')}</div>
+  </div>
+  {conflict_html}
+  <div class='sub' style='line-height:1.7; margin-top:10px; border-top:1px solid rgba(255,255,255,0.06); padding-top:8px;'>
+    <b style='color:#ff8c8c;'>Pulling the score up (top-risk):</b> {html.escape(up_txt)}<br>
+    <b style='color:#7fd99a;'>Pulling it down (bottom):</b> {html.escape(dn_txt)}<br>
+    <b>Fastest pillar:</b> {html.escape(mover_txt)} &nbsp;·&nbsp; pulls are composite points and add up to score − 50
   </div>
 </div>
 """,
@@ -1053,6 +1143,11 @@ tbl["score"] = tbl["score"].round(1)
 tbl["bucket"] = tbl["bucket"].map(pillar_names)
 tbl["as_of"] = pd.to_datetime(tbl["as_of"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("—")
 tbl["source_live"] = tbl.apply(_fmt_live_source, axis=1)
+tbl["window"] = tbl["window_years"].map(lambda v: "—" if pd.isna(v) else f"{v:.1f}y")
+tbl["status_txt"] = tbl["status"].map({
+    "ok": "scored", "display": "display only", "offline": "OFFLINE", "thin": "thin history",
+    "warmup": "under 1y of history", "stale": "STALE, not voting",
+}).fillna("—")
 
 
 def _highlight_score(v):
@@ -1070,31 +1165,34 @@ def _highlight_score(v):
 def _highlight_source(v):
     if not isinstance(v, str):
         return ""
-    if v == "OFFLINE":
+    if v == "OFFLINE" or v.startswith("STALE"):
         return "color: #c0392b; font-weight: 600;"
     if "⚠" in v:
         return "color: #e67e22;"
     return ""
 
 
-display_cols = ["label", "bucket", "raw", "percentile", "score", "as_of", "n_obs", "source_live"]
+display_cols = ["label", "bucket", "raw", "percentile", "window", "score", "status_txt", "as_of", "n_obs", "source_live"]
 styled = tbl[display_cols].rename(columns={
     "label": "Indicator",
     "bucket": "Pillar",
     "raw": "Latest",
-    "percentile": "3Y %ile",
+    "percentile": "%ile",
+    "window": "Ranked over",
     "score": "Top-risk score",
+    "status_txt": "Status",
     "as_of": "As of",
     "n_obs": "Obs",
     "source_live": "Source (live)",
-}).style.map(_highlight_score, subset=["Top-risk score"]).map(_highlight_source, subset=["Source (live)"])
+}).style.map(_highlight_score, subset=["Top-risk score"]).map(_highlight_source, subset=["Source (live)", "Status"]).format(
+    {"%ile": "{:.0f}", "Top-risk score": "{:.0f}"}, na_rep="—")
 
 st.dataframe(styled, width="stretch", hide_index=True)
 st.caption(
-    "**Source (live)** = the feed that actually served this build "
-    "(⚠ = proxy/fallback, OFFLINE = no data). Indicators with fewer than "
-    "60 observations are excluded from the composite and cluster — a score of "
-    "“—” with a low Obs count means the feed is honest-but-thin, not broken."
+    "**Latest** is the last closing print. **%ile** ranks the scored version of it (smoothed or de-trended where the "
+    "label says so) over the **Ranked over** window: up to 3 years, less only where the feed itself is shorter. "
+    "**Status**: an indicator votes only with at least 60 observations, a year of history and a print inside its "
+    "staleness allowance. **Source (live)** = the feed that actually served this build (⚠ = proxy/fallback)."
 )
 
 
@@ -1765,16 +1863,17 @@ with yc2:
 # ---------------------------------------------------------------------------
 st.markdown("### Repo market & interbank funding stress")
 st.caption(
-    "**Funding stress spread** = CP/SOFR vs T-Bill (post-LIBOR replacement for FRA-OIS). "
+    "**Funding stress spread** = 3-month AA financial commercial paper minus the 3-month T-bill: what banks pay "
+    "for unsecured money over the risk-free bill (the TED spread's successor). "
     "**SOFR spread** = repo market collateral scarcity (Sept 2019 repo crisis). "
-    "Elevated = institutional panic = bottom setup."
+    "Elevated = institutional panic = bottom setup. Both are scored on a 5-day average; the charts show daily prints."
 )
 rm1, rm2 = st.columns(2)
 with rm1:
     _line(
         raw.series.get("fra_ois_spread"),
-        "Funding Stress Spread (bps) — CP/SOFR vs T-Bill",
-        ref_lines=[(20, "normal"), (50, "elevated"), (100, "crisis")],
+        "Funding stress — 3M AA CP minus T-bill (bps)",
+        ref_lines=[(10, "normal"), (40, "elevated"), (100, "crisis")],
         indicator_key="fra_ois_spread",
         marker_ts=ts_marker,
     )
@@ -1783,7 +1882,7 @@ with rm2:
         raw.series.get("sofr_spread"),
         "SOFR Spread vs Fed Funds (bps)",
         ref_lines=[(0, "normal"), (25, "elevated"), (50, "repo stress")],
-        extra_direction="contrarian_high_is_top",
+        indicator_key="sofr_spread",
         marker_ts=ts_marker,
     )
 
@@ -1798,10 +1897,10 @@ st.caption(
     "Extreme negative readings = structural selling exhausted = bottom."
 )
 st.caption(
-    "Dashed grey = synthetic/legacy backfill, shown for context only — it is "
-    "**excluded** from scoring, the min-history gate and the cluster signal. "
-    "The solid line is measured data (CBOE delayed-chain snapshots), rebuilding "
-    "one point per trading day."
+    "Solid line = the scored series: SqueezeMetrics SPX dealer gamma, one methodology throughout. "
+    "Dashed grey = SPY-chain snapshots and legacy rows, shown for context only and **excluded** from scoring, "
+    "the cluster and the leverage gate (a different measure on a different scale). "
+    "The flip-zone distance is display only."
 )
 gx1, gx2 = st.columns(2)
 with gx1:
@@ -1831,9 +1930,10 @@ with gx2:
 # ---------------------------------------------------------------------------
 st.markdown("### Institutional positioning — Index vs Equity hedging")
 st.caption(
-    "**Index Put/Call** = institutional portfolio hedging (SPX/SPY). Spike = smart money panic. "
+    "**Index Put/Call** = institutional portfolio hedging. Spike = smart money panic. "
     "**Equity Put/Call** = retail single-stock hedging. "
-    "Index P/C extremes followed by rapid drops = hedges monetized = bottom."
+    "Index P/C extremes followed by rapid drops = hedges monetized = bottom. "
+    "Official Cboe ratios only, through Cboe's last published day. Charts show daily prints; the score uses the 10-day average."
 )
 pc1, pc2 = st.columns(2)
 with pc1:
@@ -1841,7 +1941,7 @@ with pc1:
         raw.series.get("index_put_call"),
         "Index Put/Call Ratio (Institutional)",
         ref_lines=[(0.8, "normal"), (1.2, "elevated hedging"), (1.5, "panic")],
-        extra_direction="contrarian_high_is_top",
+        indicator_key="index_put_call",
         marker_ts=ts_marker,
     )
 with pc2:
@@ -2126,13 +2226,13 @@ with dc4:
     elif not fra.empty:
         last = fra.iloc[-1]
         if last > 100:
-            st.error(f"FRA-OIS = {last:.0f} bps — crisis-level interbank stress.")
+            st.error(f"CP − T-bill = {last:.0f} bps — crisis-level funding stress.")
         elif last > 50:
-            st.warning(f"FRA-OIS = {last:.0f} bps — elevated bank funding stress.")
+            st.warning(f"CP − T-bill = {last:.0f} bps — elevated bank funding stress.")
         else:
-            st.info(f"FRA-OIS = {last:.0f} bps — interbank funding normal.")
+            st.info(f"CP − T-bill = {last:.0f} bps — unsecured funding normal.")
     else:
-        st.caption("Repo metrics: awaiting FRED data (SOFR/FRA-OIS).")
+        st.caption("Repo metrics: awaiting FRED data (SOFR / commercial paper).")
 
 with dc5:
     gex = raw.series.get("gamma_exposure", pd.Series(dtype=float))
@@ -2214,16 +2314,21 @@ with st.expander("Data sources & methodology"):
     ]
     st.dataframe(pd.DataFrame(src_rows), width="stretch", hide_index=True)
     st.markdown(
-        "**Scoring**: every indicator is converted to a 3-year rolling percentile, "
-        "oriented so 100 = complacency / top-risk and 0 = panic / bottom-setup. "
-        "Bucket scores are equal-weighted within bucket; composite is a weighted "
-        "average across the 4 buckets using the weights shown in the sidebar. "
+        "**Scoring**: each indicator is put on a business-day grid from closing data, smoothed or de-trended where "
+        "its description says so, and ranked against its own trailing 3 years (the window grows from 1 year where "
+        "the feed is shorter). The rank is oriented so 100 = complacency / top-risk and 0 = panic / bottom-setup. "
+        "Within a pillar, indicators are averaged by their config weight, which down-weights ones that share a theme. "
+        "The composite is the weighted average of the four pillars. An indicator stops voting when its last print is "
+        "older than its staleness allowance; a pillar needs half its weight live, and so does the model. "
+        "Net exposure follows the composite along straight lines between the regime bands, so it moves a little "
+        "each day instead of jumping at a threshold. A bottom cluster adds 15 points; a top cluster is a flag only. "
+        "**Extremes are relative** (against the indicator's own last 3 years); the decision desk's rules are absolute. "
         "**Live source** shows which feed actually served each indicator this "
         "build — ⚠ marks proxies and fallbacks, OFFLINE marks dark feeds."
     )
 
 
 st.caption(
-    "Not investment advice. Use cluster confluence (3–5 aligned extremes) rather "
+    "Not investment advice. Use lopsided cluster confluence and the decision desk rather "
     "than any single indicator. Tops are processes; bottoms are events."
 )

@@ -122,7 +122,7 @@ def render_decision_desk(d: dict) -> None:
                           "Risk control, not a forecast: it needs 2 hits to close.", rows + extra), unsafe_allow_html=True)
     dates = " · ".join(f"{k} {v:%d %b}" for k, v in fresh["as_of"].items())
     st.caption(
-        f"Data through: {dates}. ● fired or holds · ◐ close · ○ not met · – no data. Hover a row for its threshold. "
+        f"Closing data through: {dates}. ● fired or holds · ◐ close · ○ not met · – no data. Hover a row for its threshold. "
         "Rule output from public data, not investment advice. These rules don't change the composite score, but they "
         "limit the exposure card: it stays at or below 100% unless the leverage gate isn't closed and 3 of 5 confirmations are met."
     )

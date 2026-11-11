@@ -153,6 +153,14 @@ def main() -> int:
         print("  SKIPPED: WorldPERatio unreachable / layout changed")
         ok = False
 
+    print("AAII bull-bear spread (the scored column only)…")
+    aaii = D.aaii_sentiment()
+    if not aaii.empty and "spread" in aaii.columns:
+        _write(D.AAII_SEED, aaii[["spread"]].dropna(), 4)
+    else:
+        print("  SKIPPED: no AAII history from the live source or the local cache")
+        ok = False
+
     ok = _research_seeds() and ok
     return 0 if ok else 1
 

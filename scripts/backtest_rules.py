@@ -222,7 +222,7 @@ def test_real_model(d: dict, rep: Report) -> None:
     per = I.per_indicator_history(raw)
     sc = I.score_indicators(raw, per_indicator=per)
     pillars = I.historical_pillar_scores(raw, per_indicator=per)
-    comp = I.historical_composite(raw, pillars=pillars)
+    comp = I.historical_composite(raw, per_indicator=per)
     meta = sc.set_index("key").drop(columns=[c for c in ("score",) if c in sc.columns])
     hist = B.model_exposure_history(per, meta, comp, I.exposure_recommendation, I.cluster_signal)
     rep.add("\n## Test 2: the real composite model\n")
@@ -235,14 +235,40 @@ def test_real_model(d: dict, rep: Report) -> None:
     spy = R.px(P, "SPY")
     period = B.Period(f"{hist.index[0]:%b %Y}–{hist.index[-1]:%b %Y}", str(hist.index[0].date()), str(hist.index[-1].date()))
     table, rets = perf_rows({"Card as it was": unc, "Card with cap": cap, "Flat 100%": pd.Series(1.0, index=unc.index)}, spy, cash, period)
-    rep.add(f"Only this window has the credit data the composite needs, so it overlaps the rule-building era. Treat it as a "
-            f"check that the logic runs on real scores, not as evidence.\n\n### SPY, {period.name}\n\n{md_table(table)}")
+    rep.add(f"The window starts once 80% of the model's indicator weight has a year of history. The ICE credit spreads "
+            f"join later still, because FRED serves only three years of them. All of it overlaps the rule-building era, "
+            f"so treat it as a check that the logic runs on real scores, not as evidence.\n\n### SPY, {period.name}\n\n{md_table(table)}")
     above = unc > 1.0
     rep.add(f"- Sessions above 100%: {int(above.sum())} of {len(unc)}; capped on {int((above & (cap <= 1.0)).sum())}. "
             f"Bottom-cluster sessions: {int(hist['label'].str.startswith('BOTTOM').sum())}.")
     bt = B.bootstrap_mean_diff(rets["Card with cap"], rets["Card as it was"])
     if bt:
         rep.add(f"- Cap minus no cap: {bt['diff']:+.2f}% a year, 90% CI {bt['lo']:+.2f} to {bt['hi']:+.2f}\n")
+
+    # How often the cluster override is on, and what followed. Not a test: the
+    # window is short, the days overlap, and it sits inside the rule-building era.
+    side = hist["side"].str.upper().replace("NONE", "none")
+    rows = []
+    for name in ("TOP", "BOTTOM", "none"):
+        on = side == name
+        if not on.any():
+            rows.append({"Cluster": name, "Sessions": 0, "Share": "0.0%", "Episodes": 0, "Avg net": "n/a", "Next 21D": "n/a", "Next 63D": "n/a"})
+            continue
+        days = on[on].index
+        f21, f63 = (spy.shift(-21) / spy - 1) * 100, (spy.shift(-63) / spy - 1) * 100
+        rows.append({"Cluster": name, "Sessions": int(on.sum()), "Share": f"{on.mean() * 100:.1f}%",
+                     "Episodes": int((on.astype(int).diff() == 1).sum() + int(on.iloc[0])),
+                     "Avg net": f"{hist.loc[days, 'net_pct'].mean():.0f}%",
+                     "Next 21D": f"{f21.reindex(days).mean():+.2f}%", "Next 63D": f"{f63.reindex(days).mean():+.2f}%"})
+    rep.add("### How often the cluster override is on\n\n"
+            "A cluster needs the themes at one extreme to lead the other side by a third of the live themes. "
+            "Under the earlier rule (3 themes at one extreme, the other side ignored) a cluster was on almost every "
+            "session, most of them TOP CLUSTER at about 20 points less exposure. A bottom cluster adds "
+            f"{I.BOTTOM_CLUSTER_ADD} points. A top cluster "
+            + (f"cuts {I.TOP_CLUSTER_CUT} points" if I.TOP_CLUSTER_CUT else
+               "is a flag and changes nothing, because nothing here shows it is followed by weak returns")
+            + ". Forward SPY returns are descriptive only: overlapping days in a short window inside the "
+            "rule-building era.\n\n" + md_table(pd.DataFrame(rows)))
 
 
 def edge_row(flag: pd.Series, target: pd.Series, period: B.Period, gap: int = 10) -> dict:

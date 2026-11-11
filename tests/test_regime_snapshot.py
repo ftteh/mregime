@@ -69,7 +69,10 @@ def compute_snapshot() -> dict:
             "bottom_cluster_count": cluster["bottom_cluster_count"],
             "top_theme_count": cluster.get("top_theme_count"),
             "bottom_theme_count": cluster.get("bottom_theme_count"),
+            "need": cluster.get("need"),
+            "side": cluster.get("side"),
         },
+        "status": {r["key"]: r["status"] for _, r in scores.iterrows()},
         "comp_hist_last": _round(comp_hist.iloc[-1]) if not comp_hist.empty else None,
     }
 

@@ -40,6 +40,7 @@ def _silence_stderr():
         yield
 
 from . import analytics as A
+from . import session as SES
 from .config import FRED_API_KEY, NASDAQ_DATA_LINK_API_KEY
 
 log = logging.getLogger(__name__)
@@ -91,6 +92,7 @@ def reset_fetch_memo() -> None:
         _FETCH_MEMO_LOCKS.clear()
         _PROVENANCE.clear()
         _DISPLAY_OVERLAYS.clear()
+        _LIVE_QUOTES.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +135,51 @@ def get_display_overlays() -> dict[str, pd.Series]:
     """Snapshot of this build's display-only (non-scored) overlay series."""
     with _FETCH_MEMO_GUARD:
         return dict(_DISPLAY_OVERLAYS)
+
+
+# ---------------------------------------------------------------------------
+# Closed sessions only
+# ---------------------------------------------------------------------------
+# Quotes from a session that is still printing. They are shown on the page as
+# live context and never scored: every rule and backtest here is close-based.
+_LIVE_QUOTES: dict[str, dict] = {}
+
+
+def _closed_only(obj, label: str | None = None):
+    """Drop rows from a session still in progress; remember the dropped quote."""
+    closed, live = SES.split_live(obj)
+    if live is not None and len(live) and label and isinstance(live, pd.Series):
+        last = live.dropna()
+        if len(last):
+            prev = closed.dropna()
+            with _FETCH_MEMO_GUARD:
+                _LIVE_QUOTES[label] = {
+                    "date": pd.Timestamp(last.index[-1]),
+                    "value": float(last.iloc[-1]),
+                    "prev_close": float(prev.iloc[-1]) if len(prev) else float("nan"),
+                }
+    return closed
+
+
+def get_live_quotes() -> dict[str, dict]:
+    """In-progress quotes dropped from this build, keyed by ticker."""
+    with _FETCH_MEMO_GUARD:
+        return {k: dict(v) for k, v in _LIVE_QUOTES.items()}
+
+
+def _memo_by_key(key: str, fn):
+    """Per-build memo for fetchers that take arguments (`key` names the call)."""
+    cached = _FETCH_MEMO.get(key, _MEMO_MISSING)
+    if cached is not _MEMO_MISSING:
+        return cached
+    with _FETCH_MEMO_GUARD:
+        lock = _FETCH_MEMO_LOCKS.setdefault(key, threading.Lock())
+    with lock:
+        cached = _FETCH_MEMO.get(key, _MEMO_MISSING)
+        if cached is _MEMO_MISSING:
+            cached = fn()
+            _FETCH_MEMO[key] = cached
+        return cached
 
 
 def _memoized_fetch(fn):
@@ -310,7 +357,9 @@ def yf_series(ticker: str, period: str = "5y", field: str = "Close") -> pd.Serie
                 s = df[field].copy()
                 s.index = s.index.tz_localize(None) if s.index.tz is not None else s.index
                 s.name = ticker
-                return s.dropna()
+                # Yahoo serves today's bar while the session is open. It is a
+                # quote, not a close, so it is kept out of the scored series.
+                return _closed_only(s.dropna(), ticker)
         except Exception as e:
             log.info("yfinance unavailable for %s (%s)", ticker, str(e)[:80])
         if attempt == 1:
@@ -347,13 +396,18 @@ def _cboe_index_history(symbol: str) -> pd.Series:
         return pd.Series(dtype=float, name=symbol)
 
 
+# Scored series need more than the 3-year percentile window, or the window is
+# cut short and the "3-year percentile" is really a 2.5-year one.
+SCORED_PERIOD = "10y"
+
+
 def _yf_or_cboe(prov_key: str, ticker: str, cboe_symbol: str) -> pd.Series:
     """yfinance primary, official CBOE index-history CSV fallback — recorded."""
-    s = yf_series(ticker)
+    s = yf_series(ticker, period=SCORED_PERIOD)
     if not s.empty:
         record_provenance(prov_key, f"yfinance:{ticker}", kind="primary")
         return s
-    s = _cboe_index_history(cboe_symbol)
+    s = _closed_only(_cboe_index_history(cboe_symbol))
     if not s.empty:
         record_provenance(prov_key, f"cboe_csv:{cboe_symbol}", kind="fallback")
     else:
@@ -376,7 +430,7 @@ def skew() -> pd.Series:
 
 @_memoized_fetch
 def spx() -> pd.Series:
-    s = yf_series("^GSPC")
+    s = yf_series("^GSPC", period=SCORED_PERIOD)
     if not s.empty:
         record_provenance("spx", "yfinance:^GSPC", kind="primary")
         return s
@@ -408,14 +462,14 @@ def nasdaq_composite() -> pd.Series:
 
 def vix9d() -> pd.Series:
     """CBOE 9-day volatility index. Not on yfinance for all ranges; falls back empty."""
-    s = yf_series("^VIX9D")
-    return s if not s.empty else _cboe_index_history("VIX9D")
+    s = yf_series("^VIX9D", period=SCORED_PERIOD)
+    return s if not s.empty else _closed_only(_cboe_index_history("VIX9D"))
 
 
 def vix3m() -> pd.Series:
     """CBOE 3-month volatility index."""
-    s = yf_series("^VIX3M")
-    return s if not s.empty else _cboe_index_history("VIX3M")
+    s = yf_series("^VIX3M", period=SCORED_PERIOD)
+    return s if not s.empty else _closed_only(_cboe_index_history("VIX3M"))
 
 
 def vix_term_9d_1m() -> pd.Series:
@@ -453,7 +507,7 @@ def move_index() -> pd.Series:
     ICE BofA MOVE index from Yahoo (^MOVE). If it's unavailable, proxy with TLT
     20-trading-day annualized realized vol scaled to the MOVE range.
     """
-    move = yf_series("^MOVE", period="5y")
+    move = yf_series("^MOVE", period=SCORED_PERIOD)
     if len(move) >= 252:
         move.name = "move_index"
         record_provenance("move_index", "yfinance:^MOVE", kind="primary")
@@ -475,13 +529,25 @@ def move_index() -> pd.Series:
 # ---------------------------------------------------------------------------
 # S&P 500 constituents + breadth
 # ---------------------------------------------------------------------------
-@lru_cache(maxsize=1)
+_SP500_TICKERS: list[str] = []  # last successful scrape; the fallback list is never cached here
+
+
 def sp500_tickers() -> list[str]:
     """
     Return current SP500 tickers. Primary: Wikipedia (requires browser UA —
     their WAF blocks anonymous requests). Fallback: vetted SP100 hard-coded list
     (liquid megacaps only, no delisted/renamed tickers).
+
+    Only a successful scrape is kept for the life of the process. Caching the
+    fallback too meant one failed request at startup left breadth running on
+    80 megacaps until the next restart.
     """
+    if _SP500_TICKERS:
+        return list(_SP500_TICKERS)
+    return list(_memo_by_key("sp500_tickers", _fetch_sp500_tickers))
+
+
+def _fetch_sp500_tickers() -> list[str]:
     # Primary: Wikipedia with proper User-Agent (they 403 missing-UA requests)
     try:
         url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
@@ -496,6 +562,7 @@ def sp500_tickers() -> list[str]:
             .tolist()
         )
         if len(tickers) >= 400:  # sanity
+            _SP500_TICKERS[:] = tickers
             return tickers
     except Exception as e:
         log.info("SP500 wiki scrape unavailable (%s) — using megacap fallback", str(e)[:60])
@@ -566,7 +633,8 @@ def _sp500_close_panel() -> pd.DataFrame:
     if getattr(panel.index, "tz", None) is not None:
         panel.index = panel.index.tz_localize(None)
     panel = panel.dropna(how="all", axis=1).dropna(how="all", axis=0)
-    return panel
+    # Breadth from a half-printed session is not a closing reading.
+    return _closed_only(panel)
 
 
 def _panel_columns(sample_size: int | None = None) -> tuple[pd.DataFrame, list[str]]:
@@ -631,7 +699,7 @@ def new_highs_minus_lows(sample_size: int | None = None) -> pd.Series:
 # ---------------------------------------------------------------------------
 # Sentiment scrapers (graceful fallbacks)
 # ---------------------------------------------------------------------------
-def aaii_sentiment() -> pd.DataFrame:
+def _aaii_live() -> tuple[pd.DataFrame, str]:
     """
     AAII weekly sentiment. Returns DataFrame with bullish, bearish, neutral, spread.
     Values are in PERCENT (0-100). Spread = bullish - bearish (also in percent points).
@@ -671,7 +739,7 @@ def aaii_sentiment() -> pd.DataFrame:
                     df["spread"] = df["bullish"] - df["bearish"]
                     out = df[[c for c in cols if c in df.columns]].dropna(subset=["spread"])
                     if not out.empty:
-                        return out
+                        return out, "nasdaq_data_link:AAII_SENTIMENT"
         except Exception as e:
             log.info("Nasdaq Data Link AAII unavailable (%s)", str(e)[:80])
 
@@ -752,7 +820,7 @@ def aaii_sentiment() -> pd.DataFrame:
             if df["bullish"].iloc[-1] <= 1.0:
                 df[["bullish", "neutral", "bearish"]] = df[["bullish", "neutral", "bearish"]] * 100
             df["spread"] = df["bullish"] - df["bearish"]
-            return df[cols]
+            return df[cols], "aaii.com:sentiment.xls"
     except Exception as e:
         log.info("AAII XLS unavailable (%s)", str(e)[:80])
 
@@ -832,11 +900,55 @@ def aaii_sentiment() -> pd.DataFrame:
                 .sort_index()
             )
             df["spread"] = df["bullish"] - df["bearish"]
-            return df[cols]
+            return df[cols], "aaii.com:results page (recent weeks only)"
     except Exception as e:
         log.info("AAII HTML fallback unavailable (%s)", str(e)[:80])
 
-    return pd.DataFrame(columns=cols)
+    return pd.DataFrame(columns=cols), ""
+
+
+AAII_SEED = "aaii_sentiment_seed.csv"
+
+
+def aaii_sentiment() -> pd.DataFrame:
+    """AAII weekly sentiment (bullish, neutral, bearish, spread, in percent):
+    live rows over the local cache over a committed seed.
+
+    The full-history download succeeds on some builds and is blocked on others.
+    When it was blocked, the only live source is a page with about 21 recent
+    weeks, which is too thin to score, so the indicator dropped out of the
+    composite and came back from one build to the next. Live rows are now
+    merged over saved history, so a blocked download costs nothing.
+
+    The seed holds the bull-bear spread only (the one column the model scores)
+    and is what a fresh cloud deploy starts from, since `cache/` is local. The
+    results page then extends it, as long as the seed is under about 20 weeks
+    old: refresh it with `python -m scripts.refresh_seeds`.
+    """
+    cols = ["bullish", "neutral", "bearish", "spread"]
+    live, source = _aaii_live()
+    if not live.empty:
+        live = live[[c for c in cols if c in live.columns]].copy()
+        live.index = pd.DatetimeIndex(live.index).normalize()
+        live.index.name = "date"
+    cache = _load_frame_cache("aaii_sentiment_history.csv")
+    seed = _load_seed_frame(AAII_SEED)
+    merged = _merge_frames(seed, cache, live)
+    if merged.empty:
+        record_provenance("aaii_bull_bear", "", kind="unavailable")
+        return pd.DataFrame(columns=cols)
+    if not live.empty:
+        _save_frame_cache("aaii_sentiment_history.csv", merged)
+        partial = len(live) < len(merged)
+        record_provenance("aaii_bull_bear", source, kind="primary",
+                          note="recent weeks live, older history from the local cache or seed" if partial else "")
+    elif not cache.empty:
+        record_provenance("aaii_bull_bear", "aaii (saved history)", kind="cache",
+                          note=f"live fetch failed; cached history through {cache.index.max():%Y-%m-%d}")
+    else:
+        record_provenance("aaii_bull_bear", "bundled_seed", kind="fallback",
+                          note=f"live source unreachable and no local cache; seed through {seed.index.max():%Y-%m-%d}")
+    return merged[[c for c in cols if c in merged.columns]].dropna(subset=["spread"])
 
 
 def fear_greed_index() -> pd.Series:
@@ -844,22 +956,42 @@ def fear_greed_index() -> pd.Series:
     CNN Fear & Greed Index. Uses the public JSON endpoint backing the CNN widget.
     Returns a daily series (0-100).
     """
-    url = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
-    try:
-        r = requests.get(url, headers=UA, timeout=20)
-        r.raise_for_status()
-        data = r.json()
-        hist = data.get("fear_and_greed_historical", {}).get("data", [])
-        if not hist:
-            return pd.Series(dtype=float, name="fear_greed")
-        df = pd.DataFrame(hist)
-        df["date"] = pd.to_datetime(df["x"], unit="ms")
-        s = df.set_index("date")["y"].astype(float).sort_index()
-        s.name = "fear_greed"
-        return s
-    except Exception as e:
-        log.warning("Fear&Greed fetch failed: %s", e)
+    base = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
+    # The bare endpoint serves one year, which would make the "3-year percentile"
+    # a 6-month one. A start date in the path returns up to about five years.
+    start = (pd.Timestamp.today() - pd.DateOffset(years=5) + pd.Timedelta(days=14)).strftime("%Y-%m-%d")
+    for url, note in ((f"{base}/{start}", ""), (base, "1 year of history only")):
+        try:
+            r = requests.get(url, headers=UA, timeout=20)
+            r.raise_for_status()
+            s = _parse_fear_greed(r.json())
+        except Exception as e:
+            log.info("Fear&Greed fetch failed (%s): %s", url[-10:], str(e)[:80])
+            continue
+        if not s.empty:
+            record_provenance("fear_greed", "cnn:fearandgreed", kind="primary", note=note)
+            return s
+    record_provenance("fear_greed", "", kind="unavailable")
+    return pd.Series(dtype=float, name="fear_greed")
+
+
+def _parse_fear_greed(payload: dict) -> pd.Series:
+    """Daily closes from CNN's graph payload.
+
+    The feed stamps today's reading with a time of day and can also carry a
+    midnight row for the same date; keep one row per date (the latest), and
+    leave out a session that is still printing.
+    """
+    hist = (payload or {}).get("fear_and_greed_historical", {}).get("data", [])
+    if not hist:
         return pd.Series(dtype=float, name="fear_greed")
+    df = pd.DataFrame(hist)
+    stamp = pd.to_datetime(df["x"], unit="ms")
+    s = pd.Series(pd.to_numeric(df["y"], errors="coerce").values, index=stamp).dropna().sort_index()
+    s.index = s.index.normalize()
+    s = s[~s.index.duplicated(keep="last")]
+    s.name = "fear_greed"
+    return _closed_only(s)
 
 
 def _series_cache_path(filename: str) -> str:
@@ -899,7 +1031,7 @@ def _save_series_cache(filename: str, series: pd.Series, col_name: str) -> None:
 # snapshot GEX, an ad-hoc yfinance heuristic and a scaled-GEX synthetic
 # backfill with no marker). The `source` column makes every row attributable
 # so scoring can use measured rows only.
-GAMMA_SCORED_SOURCES = {"squeezemetrics", "cboe_snapshot"}
+GAMMA_SCORED_SOURCES = {"squeezemetrics", "cboe_snapshot"}  # flip-zone cache; GEX picks ONE of these per build
 
 
 def _empty_sourced_frame(col_name: str) -> pd.DataFrame:
@@ -1135,9 +1267,16 @@ def _ycharts_recent_indicator(slug: str, name: str) -> pd.Series:
         return pd.Series(dtype=float, name=name)
 
 
-@lru_cache(maxsize=8)
 def _cboe_delayed_options(symbol: str) -> tuple[pd.DataFrame, float]:
-    """Delayed CBOE option chain JSON with greeks, OI and volume. No API key."""
+    """Delayed CBOE option chain JSON with greeks, OI and volume. No API key.
+
+    Memoized per build, not per process: a process-lifetime cache meant a server
+    that stayed up kept re-stamping the chain it fetched at startup as "today".
+    """
+    return _memo_by_key(f"cboe_delayed_options:{symbol.upper()}", lambda: _fetch_cboe_delayed_options(symbol))
+
+
+def _fetch_cboe_delayed_options(symbol: str) -> tuple[pd.DataFrame, float]:
     url = f"https://cdn.cboe.com/api/global/delayed_quotes/options/{symbol.upper()}.json"
     try:
         r = requests.get(url, headers=UA, timeout=15)
@@ -1176,22 +1315,6 @@ def _near_expiry_options(df: pd.DataFrame, max_expiries: int = 3) -> pd.DataFram
     return df[df["expiry"].isin(expiries[:max_expiries])].copy()
 
 
-def _cboe_live_put_call_ratio(symbols: tuple[str, ...], max_expiries: int = 3) -> float | None:
-    total_calls = 0.0
-    total_puts = 0.0
-    for symbol in symbols:
-        df, _ = _cboe_delayed_options(symbol)
-        sub = _near_expiry_options(df, max_expiries=max_expiries)
-        if sub.empty or "volume" not in sub.columns:
-            continue
-        vol = sub["volume"].fillna(0.0)
-        total_calls += float(vol[sub["type"] == "C"].sum())
-        total_puts += float(vol[sub["type"] == "P"].sum())
-    if total_calls <= 0:
-        return None
-    return round(total_puts / total_calls, 4)
-
-
 def _cboe_daily_ratio(kind: str, name: str) -> pd.Series:
     """Official put/call from Cboe's daily statistics files (Oct 2019 onward).
 
@@ -1214,73 +1337,43 @@ def _cboe_daily_ratio(kind: str, name: str) -> pd.Series:
     return s
 
 
-def _official_put_call_series(
-    *,
-    kind: str,
-    ycharts_slug: str,
-    name: str,
-    cache_filename: str,
-    live_symbols: tuple[str, ...],
-) -> pd.Series:
+def _official_put_call_series(*, kind: str, ycharts_slug: str, name: str) -> pd.Series:
+    """Official Cboe put/call ratio, and nothing else.
+
+    A day with no official row yet used to be filled with an SPY/QQQ/IWM chain
+    ratio. That is a different population: ETF chains run near 1.2 while the
+    equity-only ratio runs near 0.6, so the fill ranked as a 99th-percentile
+    panic against the official history and put a false extreme into the
+    composite and the cluster. The same number also went into the index ratio.
+    The series now ends at Cboe's last published day and says so in its date.
+    The old put/call cache files held those fills and are no longer read.
+    """
     hist = _cboe_put_call_history(kind, name)
     recent = _ycharts_recent_indicator(ycharts_slug, name)
     daily = _cboe_daily_ratio(kind, name)
-    cache = _load_series_cache(cache_filename, name)
-    if not cache.empty:
-        # Scrub previously-persisted phantom dates (weekend/holiday stamps
-        # written before trading-day-aware stamping existed).
-        cache = cache[_trading_day_mask(cache.index)]
-
-    live = pd.Series(dtype=float, name=name)
-    last_market_day = last_completed_trading_day()
-    official = pd.concat([recent, daily])
-    recent_last = official.index.max().normalize() if not official.empty else pd.Timestamp.min
-    if recent_last < last_market_day:
-        live_val = _cboe_live_put_call_ratio(live_symbols)
-        if live_val is not None:
-            live = pd.Series([live_val], index=[last_market_day], name=name)
-
-    # Later legs win, so official daily rows replace any proxy rows cached earlier.
-    merged = _merge_series(name, hist, cache, recent, daily, live)
-    if not live.empty:
-        _save_series_cache(cache_filename, merged, name)
-
-    # Provenance: which legs contributed, and whether the LAST row (the one
-    # the live score reads) came from the intraday ETF-chain proxy.
+    # Later legs win: Cboe's own daily files override a YCharts copy of the same day.
+    merged = _closed_only(_merge_series(name, hist, recent, daily))
     legs = [
-        lbl for lbl, leg in (
-            ("cboe_official", hist), ("ycharts", recent), ("cboe_daily", daily),
-            ("cache", cache), ("live_etf_chain_proxy", live),
-        ) if not leg.empty
+        lbl for lbl, leg in (("cboe_archive", hist), ("ycharts", recent), ("cboe_daily", daily))
+        if not leg.empty
     ]
     if merged.empty:
         record_provenance(name, "", kind="unavailable")
     else:
-        last_from_live = (not live.empty) and merged.index[-1] == live.index[-1]
-        record_provenance(
-            name, "+".join(legs),
-            kind="fallback" if last_from_live else "primary",
-            note="last row provisional (intraday ETF-chain proxy)" if last_from_live else "",
-        )
+        record_provenance(name, "+".join(legs), kind="primary", note="official Cboe ratio")
     return merged
 
 
 def put_call_ratio() -> pd.Series:
     """
-    CBOE Equity Put/Call ratio.
+    CBOE Equity Put/Call ratio (official values only).
 
-    Source priority:
-    1. CBOE official CSV archive/recent files through Oct 2019
+    1. CBOE official CSV archive through Oct 2019
     2. CBOE daily market statistics files from Oct 2019
-    3. YCharts public recent CBOE daily-stat rows
-    4. CBOE delayed option-chain live ETF proxy + local cache
+    3. YCharts public copy of recent CBOE rows, when reachable
     """
     return _official_put_call_series(
-        kind="equity",
-        ycharts_slug="cboe_equity_put_call_ratio",
-        name="put_call",
-        cache_filename="put_call_history.csv",
-        live_symbols=("SPY", "QQQ", "IWM"),
+        kind="equity", ycharts_slug="cboe_equity_put_call_ratio", name="put_call",
     )
 
 
@@ -1409,9 +1502,21 @@ def _squeezemetrics_csv() -> pd.DataFrame:
     return pd.DataFrame()
 
 
+def _dix_percent(s: pd.Series) -> pd.Series:
+    """DIX in percent. The source publishes a fraction (0.44); the chart's
+    35 / 45 / 55 reference lines and the watchlist's "1 point above its 60-day
+    average" test are in percent, so on the raw fraction the lines were off the
+    chart and the alert could never fire."""
+    out = pd.to_numeric(s, errors="coerce").dropna()
+    if not out.empty and float(out.abs().median()) <= 1.5:
+        out = out * 100.0
+    out.name = "dix"
+    return out
+
+
 def dix_proxy() -> pd.Series:
     """
-    Dark Index (DIX) — proportion of dark pool volume that is buying.
+    Dark Index (DIX) — share of dark pool volume that is buying, in percent.
     Rising DIX during a sell-off = institutional accumulation.
 
     Source: SqueezeMetrics public CSV. Last-good copy persisted to
@@ -1425,14 +1530,14 @@ def dix_proxy() -> pd.Series:
         s.name = "dix"
         _save_series_cache("dix_history.csv", s, "dix")
         record_provenance("dix", "squeezemetrics", kind="primary")
-        return s
+        return _closed_only(_dix_percent(s))
     cached = _load_series_cache("dix_history.csv", "dix")
     if not cached.empty:
         record_provenance(
             "dix", "squeezemetrics", kind="cache",
             note=f"live fetch failed; cached history through {cached.index.max():%Y-%m-%d}",
         )
-        return cached
+        return _closed_only(_dix_percent(cached))
     record_provenance("dix", "", kind="unavailable",
                       note="SqueezeMetrics fetch failed and no cached history")
     return pd.Series(dtype=float, name="dix")
@@ -1480,68 +1585,30 @@ def cftc_cta_positioning() -> pd.Series:
       High net-long %  (>10% OI)  → CTAs heavily long → top risk
       High net-short % (<-10% OI) → CTAs capitulated  → bottom setup
 
-    Data: CFTC publishes free weekly TXT/CSV ZIPs for each calendar year.
-    We download 3 years + current year and concatenate.
+    Read from the same full-history CFTC feed as the research desk (Socrata,
+    filtered by contract code 13874A, since 2006). The old path downloaded three
+    yearly ZIPs, so the series was about 1.5 years deep after warm-up, had no
+    cache or seed behind it, and could disagree with the positioning table.
     """
-    from datetime import date as _date
+    from src import research_data as RD  # local import: research_data imports this module
 
-    current_year = _date.today().year
-    years = [current_year - 2, current_year - 1, current_year]
-
-    frames = []
-    for yr in years:
-        url = f"https://www.cftc.gov/files/dea/history/fut_fin_txt_{yr}.zip"
-        try:
-            r = requests.get(url, headers=UA, timeout=20)
-            if not r.ok:
-                continue
-            z = __import__("zipfile").ZipFile(io.BytesIO(r.content))
-            csv_files = [n for n in z.namelist() if n.lower().endswith((".txt", ".csv"))]
-            if not csv_files:
-                continue
-            df = pd.read_csv(z.open(csv_files[0]), low_memory=False)
-            # Match the contract code, not the name: "E-MINI S&P 500" also
-            # matches the much smaller Micro contract (13874U), and the two can
-            # sit on opposite sides of the market.
-            codes = df["CFTC_Contract_Market_Code"].astype(str).str.strip()
-            sub = df[codes == ES_CONTRACT_CODE].copy()
-            if sub.empty:
-                continue
-            frames.append(sub)
-        except Exception as e:
-            log.warning("CFTC COT %d failed: %s", yr, e)
-
-    if not frames:
-        return pd.Series(dtype=float, name="cta_positioning")
-
-    df = pd.concat(frames, ignore_index=True)
-
-    # Parse date (format: YYMMDD or YYYYMMDD)
-    date_col = next((c for c in df.columns if "Date" in c and "Form" in c), None) \
-               or next((c for c in df.columns if "date" in c.lower()), None)
-    if date_col is None:
-        return pd.Series(dtype=float, name="cta_positioning")
-
-    df["date"] = pd.to_datetime(df[date_col].astype(str), format="%y%m%d", errors="coerce")
-    df.loc[df["date"].isna(), "date"] = pd.to_datetime(
-        df.loc[df["date"].isna(), date_col].astype(str), format="%Y%m%d", errors="coerce"
+    name = "cta_positioning"
+    try:
+        cot = RD.cot_positioning()
+    except Exception as e:
+        log.info("CFTC positioning unavailable: %s", str(e)[:100])
+        cot = pd.DataFrame()
+    if cot is None or cot.empty or "ES" not in cot.columns:
+        record_provenance(name, "", kind="unavailable")
+        return pd.Series(dtype=float, name=name)
+    s = pd.to_numeric(cot["ES"], errors="coerce").dropna()
+    s.name = name
+    feed = get_provenance().get("cot_positioning") or {}
+    record_provenance(
+        name, feed.get("source") or "cftc:publicreporting (TFF)",
+        kind=feed.get("kind", "primary"), note=feed.get("note", ""),
     )
-    df = df.dropna(subset=["date"]).set_index("date").sort_index()
-    df = df[~df.index.duplicated(keep="last")]
-
-    long_col  = "Lev_Money_Positions_Long_All"
-    short_col = "Lev_Money_Positions_Short_All"
-    oi_col    = "Open_Interest_All"
-
-    for c in (long_col, short_col, oi_col):
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    df = df.dropna(subset=[long_col, short_col, oi_col])
-
-    # Net position as % of total open interest
-    net_pct = (df[long_col] - df[short_col]) / df[oi_col] * 100
-    net_pct.name = "cta_positioning"
-    return net_pct
+    return s
 
 
 # ---------------------------------------------------------------------------
@@ -1735,52 +1802,47 @@ def hy_spread_velocity(lookback_days: int = 20) -> pd.Series:
 # ---------------------------------------------------------------------------
 def fra_ois_spread() -> pd.Series:
     """
-    Interbank funding stress proxy.
+    Funding stress: 3-month AA financial commercial paper minus the 3-month
+    T-bill, in basis points. The closest free successor to the TED spread: what
+    banks pay for unsecured 3-month money over the risk-free bill.
 
-    The classic FRA-OIS spread is not available on FRED, and LIBOR was
-    permanently discontinued in 2023. We construct a post-LIBOR equivalent:
+    Both legs are forward-looking 3-month rates on a discount basis. The series
+    this replaces compared the SOFR 90-day AVERAGE, which looks back over the
+    last three months, with the bill, which looks forward. That gap is the
+    expected policy path, not funding stress: it read -96bp while the Fed hiked
+    in mid-2022 and +64bp as it cut in Sep 2024, with funding markets calm both
+    times.
 
-    Primary: SOFR 90-Day Average (SOFR90DAYAVG) minus 3-Month Treasury Bill
-             rate (DTB3). This captures the secured-vs-unsecured funding gap
-             that FRA-OIS used to measure. Elevated = funding stress.
-
-    Fallback: 3-Month AA Financial Commercial Paper Rate (DCPF3M) minus
-              3-Month Treasury Bill (DTB3). CP-Treasury spread is the closest
-              surviving proxy for interbank credit risk (a la TED spread).
-
-    Output is in basis points. Normal < 20bps. Crisis > 50bps.
+    Normal is about 10bp. March 2020 reached 257bp, March 2023 41bp. Daily CP
+    prints are noisy, so the scoring config smooths this over 5 sessions.
     """
-    # Path 1: SOFR 90D avg vs 3M T-Bill
-    sofr90 = _fred("SOFR90DAYAVG")
+    name = "fra_ois_spread"
     tbill3m = _fred("DTB3")
-
-    if not sofr90.empty and not tbill3m.empty:
-        df = pd.concat([sofr90.rename("sofr90"), tbill3m.rename("tbill")], axis=1).ffill().dropna()
-        if not df.empty and len(df) > 30:
-            spread = (df["sofr90"] - df["tbill"]) * 100.0  # percent -> bps
-            spread.name = "fra_ois_spread"
-            return spread.dropna()
-
-    # Path 2: Financial CP vs T-Bill (TED-like proxy)
     cp3m = _fred("DCPF3M")  # 3M AA Financial Commercial Paper rate
     if not cp3m.empty and not tbill3m.empty:
-        df = pd.concat([cp3m.rename("cp"), tbill3m.rename("tbill")], axis=1).ffill().dropna()
-        if not df.empty and len(df) > 30:
-            spread = (df["cp"] - df["tbill"]) * 100.0
-            spread.name = "fra_ois_spread"
-            return spread.dropna()
+        # CP is not published every day: carry it a few sessions, no further.
+        df = pd.concat([cp3m.rename("cp"), tbill3m.rename("tbill")], axis=1, sort=True)
+        df["cp"] = df["cp"].ffill(limit=3)
+        df = df.dropna()
+        if len(df) > 30:
+            spread = ((df["cp"] - df["tbill"]) * 100.0).dropna()  # percent -> bps
+            spread.name = name
+            record_provenance(name, "fred:DCPF3M-DTB3", kind="primary", note="3M AA financial CP minus 3M T-bill")
+            return spread
 
-    # Path 3: A2/P2 minus AA CP spread (pure credit risk tier spread)
-    cp_a2p2 = _fred("DCPN3M")  # 3M A2/P2 Nonfinancial CP
-    cp_aa = _fred("DCPF3M")    # 3M AA Financial CP
-    if not cp_a2p2.empty and not cp_aa.empty:
-        df = pd.concat([cp_a2p2.rename("low"), cp_aa.rename("high")], axis=1).ffill().dropna()
-        if not df.empty:
-            spread = (df["low"] - df["high"]) * 100.0
-            spread.name = "fra_ois_spread"
-            return spread.dropna()
+    # Fallback: A2/P2 minus AA commercial paper (credit-tier spread). A different
+    # measure, so it is labelled a proxy and never spliced onto the series above.
+    cp_a2p2 = _fred("DCPN3M")
+    if not cp_a2p2.empty and not cp3m.empty:
+        df = pd.concat([cp_a2p2.rename("low"), cp3m.rename("high")], axis=1, sort=True).ffill(limit=3).dropna()
+        if len(df) > 30:
+            spread = ((df["low"] - df["high"]) * 100.0).dropna()
+            spread.name = name
+            record_provenance(name, "fred:DCPN3M-DCPF3M", kind="proxy", note="A2/P2 minus AA CP; T-bill leg unavailable")
+            return spread
 
-    return pd.Series(dtype=float, name="fra_ois_spread")
+    record_provenance(name, "", kind="unavailable")
+    return pd.Series(dtype=float, name=name)
 
 
 def sofr_spread() -> pd.Series:
@@ -1867,45 +1929,62 @@ def _gex_implied_gamma_flip_history(gex: pd.Series) -> pd.Series:
     return proxy.dropna()
 
 
+def _session_in_progress() -> bool:
+    return SES.in_trading_hours() and not SES.include_live()
+
+
+def _snapshot_stamp() -> pd.Timestamp | None:
+    """The session a delayed-chain snapshot belongs to, or None while one is printing.
+
+    Greeks in the chain move with spot all day, so a snapshot taken at 11am is
+    not that day's reading and must not be saved as one.
+    """
+    if _session_in_progress():
+        return None
+    return last_completed_trading_day()
+
+
 @_memoized_fetch
 def gamma_exposure_proxy() -> pd.Series:
     """
     Gamma Exposure (GEX) — estimated dealer gamma, in $B per 1% move.
 
-    Only MEASURED rows are returned for scoring and persisted as scoreable:
-      - 'squeezemetrics' : historical daily GEX (when the endpoint serves data)
-      - 'cboe_snapshot'  : naive GEX from CBOE's delayed option chain, which
-                           carries REAL per-contract greeks (_cboe_gamma_snapshot)
+    Two measured sources exist and they are NOT comparable:
+      - 'squeezemetrics' : SPX dealer gamma, daily history since 2011
+      - 'cboe_snapshot'  : naive call-minus-put gamma summed over SPY's front
+                           expiries from CBOE's delayed chain
 
-    Rows written before provenance tracking stay as 'legacy_mixed' and are
-    display-only: they interleaved SqueezeMetrics GEX, CBOE-snapshot GEX and an
-    ad-hoc yfinance heuristic (oi-weighted moneyness buckets — not gamma, on an
-    arbitrary scale) in one column. That heuristic is deleted outright: a real
-    Black-Scholes recomputation from yfinance impliedVolatility was considered
-    and rejected (poor IV/OI quality, and it would add yet another methodology
-    to one series). When no measured source is available the series is honestly
-    short/empty rather than padded with fabricated values.
+    The scored series is one methodology only. SqueezeMetrics wins whenever it
+    has any rows; the SPY snapshot is then shown for context and not scored.
+    Stamping the snapshot over SqueezeMetrics' latest day, as this used to,
+    ranked a -3.9 SPY reading against a history whose 1st percentile is -1.0:
+    a false "dealers are short gamma" extreme in the composite, the cluster and
+    the leverage gate. The snapshot is scored only where SqueezeMetrics has
+    never served data, so it is still a single methodology.
+
+    Rows written before provenance tracking stay 'legacy_mixed' and display-only.
 
     When GEX is deeply negative, dealers must sell into weakness (crash
     accelerant); positive GEX = dealers buy dips, sell rips (stabilizing).
     """
     df = _load_series_cache_with_source("gamma_exposure_history.csv", "gamma_exposure")
 
-    # SqueezeMetrics, when available, gives the measured historical backbone.
-    sqz = squeezemetrics_gex()
-    if not sqz.empty:
-        df = _upsert_sourced_rows(df, _normalize_gex_units(sqz), "gamma_exposure", "squeezemetrics")
-
     today_val, _ = _cboe_gamma_snapshot("SPY")
-    if today_val is not None:
-        stamp = last_completed_trading_day()
+    stamp = _snapshot_stamp() if today_val is not None else None
+    if stamp is not None:
         live = pd.Series([float(today_val)], index=[stamp])
         df = _upsert_sourced_rows(df, live, "gamma_exposure", "cboe_snapshot")
 
-    if today_val is not None or not sqz.empty:
+    # Applied last, so the measured SPX backbone keeps every date it covers.
+    sqz = _closed_only(squeezemetrics_gex())
+    if not sqz.empty:
+        df = _upsert_sourced_rows(df, _normalize_gex_units(sqz), "gamma_exposure", "squeezemetrics")
+
+    if stamp is not None or not sqz.empty:
         _save_series_cache_with_source("gamma_exposure_history.csv", df, "gamma_exposure")
 
-    scored_mask = df["source"].isin(GAMMA_SCORED_SOURCES)
+    has_sqz = bool((df["source"] == "squeezemetrics").any())
+    scored_mask = df["source"] == ("squeezemetrics" if has_sqz else "cboe_snapshot")
     display_only = df.loc[~scored_mask, "gamma_exposure"]
     if not display_only.empty:
         _set_display_overlay("gamma_exposure", display_only.rename("gamma_exposure"))
@@ -1915,14 +1994,17 @@ def gamma_exposure_proxy() -> pd.Series:
     if out.empty:
         record_provenance("gamma_exposure", "", kind="unavailable",
                           note="no measured GEX source; legacy rows are display-only")
-    elif today_val is not None:
+    elif has_sqz and not sqz.empty:
+        record_provenance("gamma_exposure", "squeezemetrics", kind="primary", note="SPX dealer gamma")
+    elif has_sqz:
+        record_provenance("gamma_exposure", "squeezemetrics", kind="cache",
+                          note=f"live fetch failed; cached history through {out.index.max():%Y-%m-%d}")
+    elif stamp is not None:
         record_provenance("gamma_exposure", "cboe_delayed_options", kind="primary",
-                          note="naive GEX from real chain greeks; building history")
-    elif not sqz.empty:
-        record_provenance("gamma_exposure", "squeezemetrics", kind="primary")
+                          note="naive GEX from SPY chain greeks; building history")
     else:
         record_provenance("gamma_exposure", "cache(measured rows)", kind="cache",
-                          note="no live snapshot this build")
+                          note="no snapshot saved this build")
     return out
 
 
@@ -1946,8 +2028,8 @@ def gamma_flip_zone_distance() -> pd.Series:
     df = _load_series_cache_with_source("gamma_flip_history.csv", "gamma_flip")
 
     _, today_val = _cboe_gamma_snapshot("SPY")
-    if today_val is not None:
-        stamp = last_completed_trading_day()
+    stamp = _snapshot_stamp() if today_val is not None else None
+    if stamp is not None:
         live = pd.Series([float(today_val)], index=[stamp])
         df = _upsert_sourced_rows(df, live, "gamma_flip", "cboe_snapshot")
         _save_series_cache_with_source("gamma_flip_history.csv", df, "gamma_flip")
@@ -1965,12 +2047,12 @@ def gamma_flip_zone_distance() -> pd.Series:
     if out.empty:
         record_provenance("gamma_flip_zone", "", kind="unavailable",
                           note="no measured flip estimate; backfill is display-only")
-    elif today_val is not None:
+    elif stamp is not None:
         record_provenance("gamma_flip_zone", "cboe_delayed_options", kind="primary",
-                          note="gamma/OI-weighted strike midpoint estimate; building history")
+                          note="gamma/OI-weighted strike midpoint estimate; display only")
     else:
         record_provenance("gamma_flip_zone", "cache(measured rows)", kind="cache",
-                          note="no live snapshot this build")
+                          note="no snapshot saved this build (session in progress or chain unavailable)")
     return out
 
 
@@ -1982,16 +2064,11 @@ def index_put_call_ratio() -> pd.Series:
     High index P/C = institutional panic. Extreme readings followed by sharp drops
     indicate institutions monetizing hedges and buying underlying.
 
-    Uses official CBOE index P/C history and recent public YCharts rows.
-    Falls back to a CBOE delayed ETF-chain proxy only when official recent
-    rows are unavailable.
+    Official CBOE index P/C only: the archive, the daily statistics files and,
+    when reachable, YCharts' copy of recent rows.
     """
     return _official_put_call_series(
-        kind="index",
-        ycharts_slug="cboe_index_put_call_ratio",
-        name="index_put_call",
-        cache_filename="index_put_call_history.csv",
-        live_symbols=("SPY", "QQQ", "IWM"),
+        kind="index", ycharts_slug="cboe_index_put_call_ratio", name="index_put_call",
     )
 
 
@@ -2108,8 +2185,11 @@ def _with_fallback_chain(
     source: str,
 ) -> pd.DataFrame:
     """live -> disk cache -> committed seed, with provenance for every key."""
-    cache = _load_frame_cache(cache_file)
+    # Closed sessions only, on every leg: a cache written while a session was
+    # printing would otherwise hand back that half-day row as a close.
+    cache = _closed_only(_load_frame_cache(cache_file))
     seed = _load_seed_frame(seed_file)
+    live = _closed_only(live) if live is not None else live
     if live is not None and not live.empty:
         merged = _merge_frames(seed, cache, live)
         _save_frame_cache(cache_file, merged)
@@ -2296,7 +2376,7 @@ def ndx_forward_pe() -> pd.Series:
         seed_file="ndx_forward_pe_seed.csv",
         source="vcpscanner:nasdaq100 forward_pe",
     )
-    return _frame_col(df, "forward_pe", "ndx_forward_pe")
+    return _closed_only(_frame_col(df, "forward_pe", "ndx_forward_pe"))
 
 
 def _parse_worldperatio(html: str) -> pd.Series:
@@ -2365,5 +2445,6 @@ def ndx_trailing_pe() -> pd.Series:
     if out.empty:
         return out
     # A future month-end stamp (e.g. a page served without the "calculated on"
-    # line) would fake freshness for staleness checks — drop it.
-    return out[out.index <= pd.Timestamp.now().normalize()]
+    # line) would fake freshness for staleness checks, and a value computed
+    # during the session is not a close. Drop both.
+    return _closed_only(out[out.index <= pd.Timestamp.now().normalize()])

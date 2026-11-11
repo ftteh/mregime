@@ -112,7 +112,8 @@ def model_exposure_history(per_indicator: pd.DataFrame, meta: pd.DataFrame, comp
             continue
         scored = meta.loc[cols].assign(score=row.values)
         rec = recommend(float(composite.loc[d]), cluster_fn(scored), covered)
-        rows[d] = {"net_pct": rec["net_pct"], "override": rec["cluster_override"], "label": rec["label"], "covered": covered}
+        rows[d] = {"net_pct": rec["net_pct"], "override": rec["cluster_override"], "label": rec["label"], "covered": covered,
+                   "side": rec.get("cluster_side") or "none"}
     return pd.DataFrame.from_dict(rows, orient="index").sort_index()
 
 

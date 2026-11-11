@@ -9,6 +9,7 @@ import sys
 
 import numpy as np
 import pandas as pd
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -49,7 +50,7 @@ def test_fetch_failure_falls_back_to_cache(monkeypatch, tmp_path):
 
     s = D.dix_proxy()
     assert len(s) == 5
-    assert float(s.iloc[-1]) == 0.44
+    assert float(s.iloc[-1]) == pytest.approx(44.0)   # percent, like the chart's 35/45/55 lines
     prov = D.get_provenance()["dix"]
     assert prov["kind"] == "cache"
     assert "2026-06-05" in prov["note"]
@@ -62,3 +63,16 @@ def test_fetch_failure_with_no_cache_is_unavailable(monkeypatch, tmp_path):
     s = D.dix_proxy()
     assert s.empty
     assert D.get_provenance()["dix"]["kind"] == "unavailable"
+
+
+def test_dix_is_returned_in_percent_and_cached_raw(monkeypatch, tmp_path):
+    """On the raw fraction the 35/45/55 chart lines were off the chart and the
+    watchlist's 'one point above its 60-day average' alert could never fire."""
+    _patch_cache_dir(monkeypatch, tmp_path)
+    monkeypatch.setattr(D, "_squeezemetrics_csv", lambda: _fake_squeeze_df())
+    s = D.dix_proxy()
+    assert 40.0 <= float(s.min()) and float(s.max()) <= 44.0 + 1e-9
+    assert pd.read_csv(tmp_path / "dix_history.csv")["dix"].max() < 1.0      # the cache keeps source units
+    already = pd.Series([41.0, 43.0])
+    assert D._dix_percent(already).tolist() == [41.0, 43.0]                  # never scaled twice
+

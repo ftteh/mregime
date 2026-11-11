@@ -13,14 +13,21 @@ positioning, vol, and valuation — all from **free data sources**.
 ## What you get
 
 **Header** — one glance, one number:
-- Composite Regime Score gauge (0 = capitulation, 100 = euphoria)
+- Composite Regime Score gauge (0 = capitulation, 100 = euphoria), with its rank in its own 3-year range
 - SPX / VIX / HY Spread / F&G / AAII tiles
-- **Cluster detector**: tells you when ≥4 indicators are in extreme territory
+- **Cluster detector**: on when the extremes are lopsided, with one side ahead by a third of the model's
+  independent themes (8 of 22) across at least two pillars. A bottom cluster adds exposure; a top cluster
+  is a risk flag and changes nothing
+- **Today's read**: the exposure call, why, where the composite and the decision desk disagree, what would
+  change the call, and what to discount in the data
+
+Everything is scored on **closing data**. While a US session is open, the page shows live quotes for context
+and scores through the last close.
 
 **The Four Pillars** (institutional weights):
 | Pillar | Weight | What it measures |
 |---|---|---|
-| Credit & Liquidity | 40% | HY/IG spreads, MOVE, Fed Net Liquidity (WALCL−TGA−RRP), NFCI |
+| Credit & Liquidity | 40% | HY/IG spreads, MOVE, Fed Net Liquidity (WALCL−TGA−RRP), NFCI, yield curve, funding spreads |
 | Breadth & Momentum | 30% | % above 200DMA, new highs−lows, A/D line, SPX RSI, 10/20DMA trend breadth, 50D overbought−oversold spread |
 | Sentiment & Positioning | 20% | AAII, F&G, Put/Call, VIX, VVIX, SKEW |
 | Valuation | 10% | Equity Risk Premium, Nasdaq 100 trailing P/E |
@@ -53,6 +60,10 @@ The desk also limits the **Recommended Exposure** card. It can only go above 100
 isn't closed and at least 3 of 5 confirmations are met; otherwise it's capped at 100% and says why. A bottom cluster
 reads Medium conviction until price confirms. If the desk can't run, the card stays capped. The composite score is
 not affected.
+
+The composite is a relative read (each indicator against its own last 3 years) and the desk rules are absolute
+thresholds, so the two can disagree. **Today's read** says so when they do, for example a composite that reads
+fear while the washout rules haven't fired.
 
 **Research desk** — one view at a time:
 - **Positioning** — CFTC crowding across 10 futures markets, all-time vs 3-year percentile, flows, QQQ short interest
@@ -122,17 +133,16 @@ Cold starts can take **1–2 minutes** (downloads breadth data). The `cache/` pu
 
 | Source | What we pull | Method |
 |---|---|---|
-| **FRED** (St. Louis Fed) | HY spread `BAMLH0A0HYM2`, IG spread `BAMLC0A0CM`, NFCI, WALCL, TGA `WTREGEN`, RRP `RRPONTSYD`, DGS10 | `fredapi` (API key required) |
+| **FRED** (St. Louis Fed) | HY spread `BAMLH0A0HYM2`, IG spread `BAMLC0A0CM`, NFCI, WALCL, TGA `WTREGEN`, RRP `RRPONTSYD`, DGS10, 3M commercial paper `DCPF3M` and T-bill `DTB3`, SOFR, EFFR | `fredapi` (API key required) |
 | **Yahoo Finance** | ^VIX, ^VVIX, ^SKEW, ^GSPC, ^TNX, SPY, TLT, GLD, SP500 components, SPY options chain (put/call) | `yfinance` |
-| **CNN** | Fear & Greed Index (historical) | public JSON endpoint |
-| **Nasdaq Data Link** | AAII weekly sentiment (`AAII/AAII_SENTIMENT`) | API key — free, optional |
-| **yfinance options** | Put/Call computed live from SPY options chain (put vol / call vol across 3 front expiries) | daily snapshot, cached to disk |
-| **SqueezeMetrics** | DIX (dark pool index) | public CSV |
+| **CNN** | Fear & Greed Index (about 5 years of history) | public JSON endpoint |
+| **AAII** | Weekly sentiment survey | Nasdaq Data Link (optional key) or aaii.com; last good history kept in the local cache |
+| **SqueezeMetrics** | DIX (dark pool index) and SPX dealer gamma (GEX) | public CSV; disk cache |
 | **YCharts** | FINRA margin debt (monthly) — FINRA's own page/XLSX is Cloudflare-gated with no data feed | public indicator page (no key); bundled seed + disk cache fallback |
 | **Wikipedia** | SP500 constituents | scraped table |
 | **VCP Scanner** | Nasdaq 100 forward P/E (bottom-up consensus, daily since 2026-03) | public page, Next.js payload (no key); disk cache + committed seed |
 | **WorldPERatio** | Nasdaq 100 trailing P/E (QQQ basis, monthly since 1990 + live point) | public page (no key); disk cache + committed seed |
-| **CFTC** | Positioning for 10 futures markets since 2006 (TFF and Disaggregated reports) | Socrata API (no key); disk cache + committed seed |
+| **CFTC** | Positioning for 10 futures markets since 2006 (TFF and Disaggregated reports). The scored CTA indicator reads the same feed | Socrata API (no key); disk cache + committed seed |
 | **Cboe** | Daily call and put volumes by product since Oct 2019; also the official equity and index put/call ratios | one public JSON per day; committed seed, recent days fetched live |
 | **Yahoo Finance** (research) | ^MOVE, ^VXN, ^SOX, ^TYX, ^KS11, sector / factor / AI-basket prices | `yfinance`; disk cache + committed seed |
 | **Shiller + multpl** | CAPE and Excess CAPE yield since 1881, extended with FRED | public file and page (no key) |
@@ -148,13 +158,26 @@ gitignored and ephemeral on Streamlit Cloud. Refresh the seeds occasionally with
 
 ## How the composite is built
 
-1. **Raw data** for each indicator (daily, weekly — resampled where needed).
-2. **3-year rolling percentile** (0 = lowest in 3y, 100 = highest).
-3. **Orient** so that every score reads the same way:
+1. **Closing data** for each indicator, on a business-day grid. A print is carried forward only as far as its
+   staleness allowance (10 days for daily feeds, longer for weekly and monthly ones).
+2. **Smooth or de-trend** where the indicator's description says so: put/call and new highs use a 10-day average,
+   trending macro series a 1-year z-score, funding spreads only vote when above their median.
+3. **3-year rolling percentile** (0 = lowest in 3y, 100 = highest). The window grows from 1 year where the feed
+   is shorter; under a year of history there is no score.
+4. **Orient** so that every score reads the same way:
    - `risk_high_is_top`: raw pct used directly (e.g. AAII bull %)
    - `contrarian_high_is_top`: inverted (e.g. VIX — a high VIX is *bullish*, so score = 100 − pct)
-4. **Bucket score** = equal-weighted average of indicator scores within a pillar.
-5. **Composite** = weighted average of the four pillars.
+5. **Pillar score** = average of its indicators by config weight (indicators that share a theme are down-weighted).
+   A pillar needs half its weight live.
+6. **Composite** = weighted average of the four pillars. It needs half the model's weight live, and conviction is
+   Low below 80%.
+7. **Net exposure** follows the composite along straight lines between the regime bands' levels (130% / 115% /
+   100% / 90% / 50% / 20% at each band's centre), so it moves a few points a day instead of jumping 40 points
+   at a threshold. A bottom cluster adds 15 points. A top cluster is flagged and does not cut: it has no
+   tested edge (`TOP_CLUSTER_CUT` in `src/indicators.py` restores a cut).
+
+An indicator stops voting when it has under 60 observations, under a year of history, or a last print older than
+its allowance. The indicator table shows which, and what window each one is ranked over.
 
 ### Interpretation
 
@@ -167,8 +190,8 @@ gitignored and ephemeral on Streamlit Cloud. Refresh the seeds occasionally with
 | 15–35 | Panic | Accumulate quality |
 | **< 15** | Capitulation | Aggressive accumulation |
 
-> **Never trade on the composite alone.** Use it as context. The real signal is a
-> cluster of 3–5 pillar-extreme indicators (shown in the "Cluster signals" card).
+> **Never trade on the composite alone.** Use it as context, with the decision desk beside it.
+> The composite averages 30-odd percentile scores, so it rarely leaves 25–70: read its rank in its own range.
 
 ---
 
@@ -183,13 +206,14 @@ quant/
 └── src/
     ├── config.py          # Indicator specs, bucket weights, regime thresholds
     ├── data.py            # All data fetchers (FRED, yfinance, scrapers) + fallback chains
-    ├── indicators.py      # Percentile/z-score engine, composite scorer
+    ├── session.py         # US session clock: which bars are closed, which are still printing
+    ├── indicators.py      # Percentile/z-score engine, composite scorer, cluster, exposure mapping
     ├── analytics.py       # Pure math: breadth, OB/OS, relative strength, valuation stats, z-scores
     ├── charts.py          # Plotly builders for the market-internals / z-score panels
     ├── research.py        # Pure research engine: positioning, correlation, PCA, event studies, decision rules
     ├── research_data.py   # Research feeds with live -> cache -> seed fallback
     ├── research_charts.py # Plotly builders for the research desk
-    ├── desk.py            # Assembles rules, tables and the model posture
+    ├── desk.py            # Assembles rules, tables, the model posture and the reconciled read
     ├── desk_ui.py         # Streamlit rendering for the decision and research desks
     ├── backtest.py        # Daily rule histories and performance tools for scripts/backtest_rules.py
     └── seeds/             # Committed fallback history (regenerate: python -m scripts.refresh_seeds)
@@ -211,12 +235,28 @@ quant/
 - **Rule testing**: `python -m scripts.backtest_rules` tests the decision rules against criteria fixed in advance
   and writes `.claude/plan/rule-backtest-results.md`. The cap passed as risk control. The capitulation count failed
   on untouched 2003–2016 data, so don't read a washout as evidence of a bottom.
+- **Composite and cluster are not validated on returns.** The full four-pillar model only exists from late 2022,
+  a bull market, and over that window the exposure card did not beat holding 100% (see Test 2 in the results
+  file). Bottom clusters were followed by strong returns and top clusters by ordinary ones, on about ten and
+  about thirty episodes of overlapping days: descriptive only. That is why a top cluster is a flag and not a cut.
+- **Closing basis**: a session still in progress is never scored. Set `QUANT_INCLUDE_LIVE=1` to score the
+  unfinished bar; the page then marks every reading provisional.
+- **Extremes are relative.** A score near 0 or 100 means extreme against the indicator's own last 3 years. HY
+  spreads at 3.3% can score as "wide" after three years of tighter spreads while being tight in absolute terms.
 - **Event studies**: permutation p-values on overlapping crisis events, across many signals and horizons. Some rows
   will clear p ≤ 0.05 by chance, and thin buckets are flagged. Treat them as evidence, not forecasts.
 - **CFTC**: as of Tuesday, published Friday. Backtests lag flags to publication. Leveraged-fund Treasury shorts are
   largely the basis trade, so read the 3-year percentile alongside the all-time one.
 - **ICE credit spreads on FRED**: only about 3 years are served, so older history depends on the local cache and seed.
-- **Put/Call**: official Cboe ratios. An ETF-chain proxy only fills a day with no official row yet, and is flagged.
+- **Put/Call**: official Cboe ratios only, through Cboe's last published day. Nothing fills the gap before
+  Cboe publishes.
+- **Gamma**: the scored series is SqueezeMetrics SPX dealer gamma. The SPY chain snapshot is a different measure
+  and is charted, not scored. The flip-zone distance is display only.
+- **Funding stress**: 3-month AA commercial paper minus the T-bill. Commercial paper isn't published every day
+  and trails by a few sessions.
+- **AAII**: the full-history file is blocked on some builds. The last good history is kept in `cache/` and a
+  committed seed of the bull-bear spread covers a fresh cloud deploy; the results page then adds recent weeks.
+  Refresh the seed with `python -m scripts.refresh_seeds` before it is more than about 20 weeks old.
 - **Breadth**: computed across all ~503 current S&P 500 constituents (one 5-year bulk download,
   ~15s), equal-weighted. Uses current membership, so history carries survivorship bias.
 - **Nasdaq 100 forward P/E**: Bloomberg's BEst series is paid. The free forward history (VCP Scanner)

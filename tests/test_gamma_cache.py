@@ -18,6 +18,9 @@ from src.config import MIN_OBS
 
 def _patch_cache_dir(monkeypatch, tmp_path):
     monkeypatch.setattr(D, "_series_cache_path", lambda fn: str(tmp_path / fn))
+    # Snapshots are only saved outside trading hours; pin that so the tests
+    # don't depend on when they run.
+    monkeypatch.setattr(D, "_session_in_progress", lambda: False)
 
 
 def _write_old_schema(tmp_path, filename, col, n=5):
@@ -128,3 +131,42 @@ def test_thin_measured_history_stays_below_min_obs():
     raw = I.RawFrame(series=series, meta=meta)
     panel = I.per_indicator_history(raw)
     assert "gamma_flip_zone" not in panel.columns
+
+
+def test_squeezemetrics_and_snapshot_are_never_mixed(monkeypatch, tmp_path):
+    """The SPY chain snapshot used to be stamped over SqueezeMetrics' latest
+    day and ranked against its history: a different measure on a different scale."""
+    _patch_cache_dir(monkeypatch, tmp_path)
+    D.reset_fetch_memo()
+    idx = pd.bdate_range("2026-05-25", periods=10)          # ends 2026-06-05
+    sqz = pd.Series(np.linspace(4.0, 6.0, 10), index=idx)
+    monkeypatch.setattr(D, "squeezemetrics_gex", lambda: sqz)
+    monkeypatch.setattr(D, "_closed_only", lambda obj, label=None: obj)
+    monkeypatch.setattr(D, "_cboe_gamma_snapshot", lambda symbol="SPY": (-3.9, None))
+    monkeypatch.setattr(D, "last_completed_trading_day", lambda now=None: pd.Timestamp("2026-06-08"))
+
+    out = D.gamma_exposure_proxy()
+    assert len(out) == 10 and float(out.iloc[-1]) == 6.0      # SqueezeMetrics only
+    assert -3.9 not in out.values
+    overlay = D.get_display_overlays()["gamma_exposure"]
+    assert float(overlay.loc[pd.Timestamp("2026-06-08")]) == -3.9   # shown, not scored
+    assert D.get_provenance()["gamma_exposure"]["source"] == "squeezemetrics"
+
+    # Same day in both: the SPX backbone keeps the date.
+    D.reset_fetch_memo()
+    monkeypatch.setattr(D, "last_completed_trading_day", lambda now=None: pd.Timestamp("2026-06-05"))
+    out = D.gamma_exposure_proxy()
+    assert float(out.loc[pd.Timestamp("2026-06-05")]) == 6.0
+
+
+def test_snapshot_is_not_saved_while_a_session_is_printing(monkeypatch, tmp_path):
+    """Chain greeks move with spot all day: an 11am snapshot is not that day's reading."""
+    _patch_cache_dir(monkeypatch, tmp_path)
+    D.reset_fetch_memo()
+    monkeypatch.setattr(D, "_session_in_progress", lambda: True)
+    monkeypatch.setattr(D, "_cboe_gamma_snapshot", lambda symbol="SPY": (4.2, 1.5))
+    monkeypatch.setattr(D, "squeezemetrics_gex", lambda: pd.Series(dtype=float))
+    assert D.gamma_exposure_proxy().empty
+    assert D.gamma_flip_zone_distance().empty
+    assert not (tmp_path / "gamma_exposure_history.csv").exists()
+

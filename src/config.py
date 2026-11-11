@@ -49,10 +49,30 @@ class IndicatorSpec:
     # (net liquidity, DXY, real yields, copper/gold) saturate a raw rolling
     # percentile at 0/100 for months; a rolling z-score re-centres them on their
     # own recent regime so the percentile measures deviation, not level/drift.
-    #   None      -> rank the raw level (default; mean-reverting series)
-    #   "zscore"  -> rank a rolling z-score over `transform_window`
+    #   None          -> rank the raw level (default; mean-reverting series)
+    #   "zscore"      -> rank a rolling z-score over `transform_window`
+    #   "active_only" -> an event flag that sits at exactly 0 when it is off.
+    #                    Off scores a neutral 50; on scores 50-100 by its rank
+    #                    among past active readings. Ranking the zeros gave an
+    #                    arbitrary score equal to the share of zeros in the window.
+    #   "stress_only" -> a spread that only carries information when it is high.
+    #                    Readings below the window median all score a neutral 50;
+    #                    above it the usual rank applies. A funding spread of -3bp
+    #                    instead of +5bp is noise, not "extreme complacency".
     transform: str | None = None
     transform_window: int = 252
+    # Business-day moving average applied before the percentile. Daily put/call
+    # and new-highs prints are mostly noise one day at a time (the raw equity
+    # put/call moved its own score 30+ points on about one day in four), and the
+    # standard reading of each is its 5- or 10-day average.
+    smooth: int = 1
+    # Calendar days a reading may lag the newest data before it stops voting.
+    # A dead feed used to keep its last score at full weight indefinitely.
+    # Daily feeds get 10 days (publication lags and holidays, not just a day);
+    # weekly and monthly feeds set their own.
+    max_stale_days: int = 10
+    # Charted and tabled, never scored.
+    display_only: bool = False
 
 
 # Minimum observations an indicator must have before its percentile score is
@@ -60,6 +80,30 @@ class IndicatorSpec:
 # otherwise score 0/100 and masquerade as real extremes in the composite and
 # the high-conviction cluster override.
 MIN_OBS = 60
+
+# Percentile window warm-up, in business days. The window grows from one year of
+# history to the full three and then rolls. The engine used to halve the window
+# for any series under six years long, so several "3-year percentiles" were
+# really 6 to 18 months.
+PCT_MIN_PERIODS = 252
+
+# A reading at or beyond these oriented scores counts as an extreme for the cluster.
+EXTREME_TOP = 85.0
+EXTREME_BOTTOM = 15.0
+
+# A cluster is a LOPSIDED set of extremes: themes at one extreme minus themes at
+# the other must reach this share of the live themes (8 of 22), across 2+ pillars.
+# The rule used to be "3 themes at one extreme", ignoring the other side. Each
+# tail is 15% of an indicator's own history, so with 22 themes about five sit at
+# each extreme on an ordinary day: over 2024-2026 that rule had a cluster on 99%
+# of sessions and "TOP CLUSTER, cut 20 points, High conviction" on 9 in 10.
+CLUSTER_NET_SHARE = 1.0 / 3.0
+
+# Share of a pillar's indicator weight that must be live for the pillar to be
+# scored, and share of the whole model that must be live for a composite at all.
+# One surviving indicator used to stand in for a whole pillar at full weight.
+BUCKET_MIN_COVERAGE = 0.5
+MODEL_MIN_COVERAGE = 0.5
 
 
 INDICATORS: list[IndicatorSpec] = [
@@ -94,6 +138,7 @@ INDICATORS: list[IndicatorSpec] = [
         bucket="credit_liquidity", source="FRED:NFCI",
         direction="contrarian_high_is_top",
         description="Chicago Fed NFCI. Above 0 = tight = stress = bottom setup. Below 0 = loose = supportive of tops.",
+        max_stale_days=16,  # weekly, published Wednesday for the prior Friday
     ),
 
     # 2. Breadth & Momentum (30%)
@@ -104,10 +149,11 @@ INDICATORS: list[IndicatorSpec] = [
         description="Breadth health. >80% = extended top risk, <20% = washout bottom.",
     ),
     IndicatorSpec(
-        key="ad_line_slope", label="Advance-Decline Line Momentum",
-        bucket="breadth_momentum", source="yfinance:^NYAD / computed",
+        key="ad_line_slope", label="Advance-Decline Line (vs 1y trend)",
+        bucket="breadth_momentum", source="computed: S&P 500 constituents",
         direction="risk_high_is_top",
-        description="NYSE cumulative A/D. High cumulative A/D = mature bull = top risk.",
+        description="Cumulative advancers minus decliners across S&P 500 constituents over the full panel, z-scored vs its own 1y regime (a cumulative line trends, so its raw level pins the percentile). High vs trend = mature, broad advance = top risk; low = persistent net declines = bottom setup.",
+        transform="zscore",
     ),
     IndicatorSpec(
         key="rsi_spx", label="SPX 14D RSI",
@@ -119,7 +165,8 @@ INDICATORS: list[IndicatorSpec] = [
         key="new_highs_lows", label="NYSE 52W New Highs - Lows",
         bucket="breadth_momentum", source="yfinance:SP500 components",
         direction="risk_high_is_top",
-        description="Participation. Many net new highs = extended top. Net new lows = washout bottom.",
+        description="Participation, 10-day average. Many net new highs = extended top. Net new lows = washout bottom.",
+        smooth=10,
     ),
 
     # 3. Sentiment & Positioning (20%)
@@ -128,6 +175,7 @@ INDICATORS: list[IndicatorSpec] = [
         bucket="sentiment_positioning", source="scrape:aaii.com",
         direction="risk_high_is_top",
         description="Retail sentiment. Extreme bullish spread = contrarian top.",
+        max_stale_days=14,  # weekly survey
     ),
     IndicatorSpec(
         key="fear_greed", label="CNN Fear & Greed",
@@ -136,11 +184,11 @@ INDICATORS: list[IndicatorSpec] = [
         description="Composite crowd fear/greed. Extreme greed = top, extreme fear = bottom.",
     ),
     IndicatorSpec(
-        key="put_call", label="CBOE Equity Put/Call Ratio",
-        bucket="sentiment_positioning", source="CBOE/YCharts",
+        key="put_call", label="CBOE Equity Put/Call Ratio (10D avg)",
+        bucket="sentiment_positioning", source="CBOE official daily statistics",
         direction="contrarian_high_is_top",
-        description="Options hedging demand. Spikes = panic bottom, <0.5 = complacency top. INVERTED. Down-weighted: shares the put/call theme with the index ratio.",
-        weight=0.5,
+        description="Options hedging demand, official Cboe ratio, 10-day average. High = panic bottom, low = complacency top. INVERTED. Down-weighted: shares the put/call theme with the index ratio.",
+        weight=0.5, smooth=10,
     ),
     IndicatorSpec(
         key="vix", label="VIX",
@@ -184,6 +232,7 @@ INDICATORS: list[IndicatorSpec] = [
             ">10% net long = CTAs fully loaded (top risk). "
             "<-10% net short = CTAs capitulated (bottom setup). Weekly."
         ),
+        max_stale_days=21,  # as of Tuesday, published Friday; holidays delay it further
     ),
 
     # 6. VIX term structure (sentiment pillar)
@@ -219,7 +268,8 @@ INDICATORS: list[IndicatorSpec] = [
         key="curve_resteep_2s10s", label="2s10s Re-steepening from Inversion",
         bucket="credit_liquidity", source="derived:T10Y2Y",
         direction="risk_high_is_top",
-        description="Active re-steepening after inversion. Fires when 12m min was inverted and curve is recovering — historically coincides with recession onset and equity tops (2000/2007/2020).",
+        description="Active re-steepening after inversion. Fires when 12m min was inverted and curve is recovering — historically coincides with recession onset and equity tops (2000/2007/2020). A top-risk warning only: it scores a neutral 50 while off and 50-100 while active.",
+        transform="active_only",
     ),
 
     # 8. Credit spread velocity (credit & liquidity pillar)
@@ -255,41 +305,43 @@ INDICATORS: list[IndicatorSpec] = [
 
     # 10. Interbank Funding Stress (Repo Market / FRA-OIS)
     IndicatorSpec(
-        key="fra_ois_spread", label="Funding Stress Spread (CP-TBill proxy)",
-        bucket="credit_liquidity", source="FRED:SOFR90DAYAVG/DTB3/DCPF3M",
+        key="fra_ois_spread", label="Funding Stress Spread (3M CP − T-Bill, 5D avg)",
+        bucket="credit_liquidity", source="FRED:DCPF3M/DTB3",
         direction="contrarian_high_is_top",
-        description="Post-LIBOR interbank stress proxy: SOFR 90D avg vs T-Bill or CP-TBill spread. Replaces FRA-OIS (LIBOR discontinued 2023). Elevated = funding stress = bottom setup.",
+        description="3-month AA financial commercial paper minus the 3-month T-bill, 5-day average: the closest free successor to the TED spread. Both legs look forward three months, so it measures unsecured funding cost, not the expected policy path. Elevated = funding stress = bottom setup. One-sided: a calm reading is neutral, not a top-risk vote.",
+        smooth=5, transform="stress_only",
     ),
     IndicatorSpec(
         key="sofr_spread", label="SOFR Spread (vs Effective Fed Funds)",
         bucket="credit_liquidity", source="FRED:SOFR/DFF",
         direction="contrarian_high_is_top",
-        description="SOFR vs Fed Funds spread. Elevated = repo market stress / collateral scarcity (Q4 2019, March 2020). High = liquidity squeeze = bottom regime.",
+        description="SOFR vs Fed Funds spread, 5-day average (single prints spike at month-end). Elevated = repo market stress / collateral scarcity (Q4 2019, March 2020). High = liquidity squeeze = bottom regime. One-sided: a calm reading is neutral, not a top-risk vote.",
+        smooth=5, transform="stress_only",
     ),
 
     # 11. Gamma Exposure (GEX) - Options Market Structure
     IndicatorSpec(
-        key="gamma_exposure", label="Gamma Exposure (GEX) Proxy",
-        bucket="sentiment_positioning", source="CBOE delayed SPY options",
+        key="gamma_exposure", label="Gamma Exposure (GEX, 5D avg)",
+        bucket="sentiment_positioning", source="SqueezeMetrics (SPX dealer gamma)",
         direction="risk_high_is_top",
-        description="Estimated dealer gamma exposure from SPY options. Deep negative GEX = market makers forced to sell into weakness (crash accelerant). Extreme negative = capitulation = bottom. Positive = stability. Down-weighted: shares the gamma theme with the flip-zone metric.",
-        weight=0.5,
+        description="Estimated SPX dealer gamma, 5-day average, one methodology only (SqueezeMetrics; the SPY chain snapshot is charted but not scored unless SqueezeMetrics has never served data). Deep negative GEX = market makers forced to sell into weakness (crash accelerant). Extreme negative = capitulation = bottom. Positive = stability.",
+        weight=0.5, smooth=5,
     ),
     IndicatorSpec(
         key="gamma_flip_zone", label="Gamma Flip Zone Distance (%)",
         bucket="sentiment_positioning", source="CBOE delayed SPY options / GEX proxy",
         direction="contrarian_high_is_top",
-        description="Distance to 'zero gamma' price where dealer hedging flips from buy-to-sell to sell-to-buy. Near/past flip = volatility expansion = bottom risk. Down-weighted: shares the gamma theme with GEX.",
-        weight=0.5,
+        description="Distance to an estimated 'zero gamma' price. Display only: the estimate is the midpoint of gamma/OI-weighted put and call strikes, not a recomputed zero-gamma level, and its history is a handful of sparse snapshots. It is charted for context and does not vote.",
+        weight=0.5, display_only=True,
     ),
 
     # 12. Enhanced Institutional Positioning
     IndicatorSpec(
-        key="index_put_call", label="Index Put/Call Ratio (Institutional Hedging)",
-        bucket="sentiment_positioning", source="CBOE/YCharts",
+        key="index_put_call", label="Index Put/Call Ratio (10D avg)",
+        bucket="sentiment_positioning", source="CBOE official daily statistics",
         direction="contrarian_high_is_top",
-        description="Institutions hedge portfolios with index puts (not equity puts). Spike = panic hedging by smart money. Extreme spike then rapid drop = hedges monetized = bottom. Down-weighted: shares the put/call theme with the equity ratio.",
-        weight=0.5,
+        description="Institutions hedge portfolios with index puts (not equity puts). Official Cboe ratio, 10-day average. High = heavy institutional hedging = bottom setup. Down-weighted: shares the put/call theme with the equity ratio.",
+        weight=0.5, smooth=10,
     ),
 
     # 13. Full-universe participation breadth (breadth & momentum pillar)
@@ -329,6 +381,7 @@ INDICATORS: list[IndicatorSpec] = [
             "(bottom setup). Adds a direct multiple to the valuation pillar alongside the rates-relative ERP. "
             "Forward P/E is charted but not scored until its free history is long enough."
         ),
+        max_stale_days=45,  # monthly history; the live point is daily when the source is up
     ),
 ]
 
